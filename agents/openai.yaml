@@ -1,0 +1,6 @@
+interface:
+  display_name: "自适应多代理路由"
+  short_description: "显式启用后由主代理判断是否分派，并自适应选择模型与核验结果"
+  default_prompt: "使用 $adaptive-agent-routing 处理以下任务，由主代理判断是否需要子代理并选择合适模型：<任务>"
+policy:
+  allow_implicit_invocation: false
