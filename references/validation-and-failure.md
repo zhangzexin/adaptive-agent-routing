@@ -45,6 +45,8 @@ Require an independent deep reviewer for:
 
 The reviewer must be a separate work unit from the implementer and default to Sol `xhigh`; use Max only for an exceptionally hard single review. Return findings to the original owner when possible, then repeat affected validation.
 
+`luna_max_only` cannot satisfy this independent child-review floor because every child is constrained to Luna Max while a qualifying high-risk reviewer is Sol. Do not weaken or relabel the reviewer requirement. Keep the high-risk work and adjudication in a sufficiently capable parent, or ask the user to rerun without `children=luna-max` before delegating it.
+
 ## Read-only enforcement levels
 
 `agents/openai.yaml` configures this Skill's UI and invocation policy; it does not create a sandboxed custom reviewer.
@@ -108,6 +110,24 @@ Classify before retrying or upgrading:
 
 An unchanged retry is appropriate only for a genuinely transient failure such as a one-off network response or process crash. A deterministic test failure is evidence, not a transient event.
 
+In `luna_max_only`, the failure response is additionally constrained:
+
+- `transient`: retry the same exact Luna Max contract at most once;
+- `missing_context`, `bad_decomposition`, or `weak_oracle`: repair the contract in the parent before considering any later delegation;
+- `reasoning_failure`, `scope_became_open`, or a substantive validation failure: stop child execution for the node rather than spawning another Luna Max repair worker;
+- `runtime_unavailable`: keep the target planned or record an exact rejected attempt as `dispatch_blocked`; never switch the child pair;
+- any path that needs Sol/Terra capability: keep it in the parent or obtain user direction to leave Luna-Max-only mode.
+
+For every recorded Luna-Max-only result, the parent adds `failure_classification` and `failure_evidence`. Use `none` plus an empty evidence list for `success`; every non-success result uses a concrete classification from the table above and non-empty observable evidence. Each evidence item must contain at least one visible letter or number and no surrounding whitespace, invisible characters, or controls; blank-rendering symbols are not evidence. Only `status: failed` plus `failure_classification: transient` is retry-eligible. A child calling its own failure transient is not sufficient: the parent must verify the evidence. Deterministic test/schema/compiler failures, bad decomposition, missing context, weak oracles, and reasoning failures are not transient retries.
+
+The Luna-Max-only ledger orders every spawn attempt and recorded child result with one global, contiguous, append-only `event_seq`. The earliest completed `partial`, `blocked`, `failed`, or `escalate` result creates the one failure fence at its sequence; a terminal `dispatch_blocked` node can create it at its last rejected attempt. No later spawn is permitted, regardless of wave, node ID, work-unit ID, or cosmetic contract changes, except the one valid direct transient retry of that earliest failed initial node. Every retry attempt must have an event sequence later than the initial failure result. A sibling whose dispatch was recorded before the fence may still finish and be integrated, but its later failure cannot authorize another retry. Keep all planned-but-unspawned or newly discovered work in the parent after the fence.
+
+## Economy evaluation failures
+
+Missing candidates, invalid or non-finite inputs, incomparable metric sources, formula mismatches, a non-minimum selected pair, or a selected child cost that does not beat the parent baseline are pre-dispatch policy failures, not transient execution failures. Correct the ledger/evidence or keep the work in the parent; do not consume a child retry to repair an Economy evaluation.
+
+Qualitative Economy is valid when measurements are absent, but it proves only the declared order. It must emit a qualitative-only warning and cannot be reported as quantified savings. If actual post-dispatch outcomes later differ from the estimate, preserve the historical ledger and use authorized, comparable telemetry to calibrate future decisions rather than rewriting the earlier evidence window.
+
 ## Attempt budgets
 
 Default ceilings per node:
@@ -118,6 +138,12 @@ Default ceilings per node:
 - at most one Max use;
 - after the same substantive failure twice, replan or escalate to a deep diagnostician instead of adding equal workers;
 - after two review/repair rounds without new evidence, stop and report the unresolved risk.
+
+For `luna_max_only`, tighten `substantive_attempts` to `1` and cap a declared work unit at the initial exact attempt plus one unchanged transient retry. Every node records `work_unit_id`, `retry_kind`, and `retry_of`; the retry keeps the same executor and contract, points directly to a completed failed initial node, and has zero retry budget remaining. Parent-local recovery and explicit user-approved rerouting are separate decisions, and a fresh work-unit ID must not be used to disguise child rework.
+
+Event sequence is an audit invariant, not an after-the-fact label. Append it as each spawn receipt or child result is recorded, including rejected spawn attempts; never reorder or renumber prior events to make a post-failure dispatch appear earlier.
+
+`max_uses: 1` is per node and counts a runtime-accepted Max child, not a rejected spawn that produced no effective child. One rejected dispatch followed by one accepted retry can therefore coexist with `max_uses: 1`. A linked cross-node transient retry is the only path that may create a second accepted Luna Max child for the same work unit.
 
 These are ceilings, not targets. Stop sooner when authority, safety, time, or evidence requires it. A user-supplied stricter budget wins.
 

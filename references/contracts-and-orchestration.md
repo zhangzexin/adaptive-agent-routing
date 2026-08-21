@@ -60,6 +60,8 @@ discovery -> design -> implementation -> validation -> independent review -> int
 
 Do not parallelize a serial knowledge dependency merely because files differ. For validation plans, assign each node to an integer `wave`; every dependency must be in an earlier wave.
 
+For Luna-Max-only execution, wave ordering is only the static plan. Before any actual attempt, every dependency must already have a completed `success` result and the attempt's `event_seq` must be later than that result event. The retry edge to its own initial node is the only status exception: the initial is completed `failed`, parent-classified `transient` with evidence, and the retry spawn still occurs after its result event.
+
 ## Semantic conflict groups
 
 File ownership is necessary but insufficient. Two different files may implement the same mutable contract.
@@ -105,6 +107,10 @@ agent_label:
 task_name:
 dispatch_attempt:
 executor_id:
+child_policy: adaptive | luna_max_only
+work_unit_id:                 # required for luna_max_only
+retry_kind: none | transient  # substantive is invalid for luna_max_only
+retry_of:                     # null for initial; prior node ID for transient retry
 assigned_pair: {model:, family:, effort:}
 confirmation_status: confirmed-explicit | confirmed-inherited | fallback-confirmed
 dispatch_mode: explicit | inherit_parent
@@ -147,14 +153,19 @@ Stay within the owned surfaces and authority below. Escalate instead of expandin
 
 For `explicit`, pass both `model` and `reasoning_effort`; never rely on a model's default effort. Use `fork_turns: "none"` or a supported positive history slice and provide the complete dossier. For `inherit_parent`, omit both overrides only after the exact parent pair is known to satisfy the requirements, and use the full-history fork guaranteed by the current collaboration contract. Do not combine `fork_turns: "all"` with explicit overrides.
 
+For `luna_max_only`, `assigned_pair` must be exactly `{model: gpt-5.6-luna, family: luna, effort: max}` and `dispatch_mode` must be `explicit`. Pass both exact override values on every attempt, including an unchanged transient retry. Inheritance, fallback, and model-default resolution are forbidden. A child dossier must not claim that the policy makes general/open/critical or high-risk work suitable for Luna.
+
 Before the tool call, announce the exact agent label, pair, mode, purpose, and planned pair-first task name. After the call, record its accepted or rejected receipt before treating the node as dispatched.
 
 ## Result envelope
 
-Require the child to return:
+Require the child to return the fields below. When the parent records a Luna-Max-only result in the ledger, it appends `event_seq` and independently attests `failure_classification`/`failure_evidence`; these are parent-authored audit metadata, not unverified child claims. Use `none` and an empty evidence list for success. For non-success, choose a classification from the failure table in [validation-and-failure.md](validation-and-failure.md) and cite non-empty observable evidence.
 
 ```yaml
 status: success | partial | blocked | failed | escalate
+event_seq:                     # required for luna_max_only; global append-only order
+failure_classification:        # required for luna_max_only; parent-verified, none on success
+failure_evidence: []           # required; non-empty for a non-success result
 dispatch_attempt:
 agent_label:
 assigned_pair_echo: {model:, family:, effort:}
@@ -201,9 +212,11 @@ Use these confirmation states exactly:
 
 For complex fan-out or high-risk work, write a temporary JSON routing ledger and validate it before spawning, after every receipt transition, and before final reporting. Start from the machine-checked [complete example](routing-plan.example.json); the regression suite loads that exact file and requires the validator to accept it.
 
-The root object uses `schema_version: aar.routing-ledger.v2` and must contain `ledger_phase`, profile and metric evidence fields, orchestration state, the live runtime catalog, and explicit child nodes. The earlier draft identifier `aar.routing-plan.v2` is intentionally incompatible because it cannot record execution receipts. `ledger_phase` is `planning`, `active`, or `finalized`.
+The root object uses `schema_version: aar.routing-ledger.v2` and must contain `ledger_phase`, profile and metric evidence fields, orchestration state, the live runtime catalog, and explicit child nodes. If the invocation omits `profile=`, materialize the default as `profile: balanced`; the field is never omitted. New ledgers should also record `child_policy: adaptive | luna_max_only`; omission is accepted only for backward compatibility and means `adaptive`. The earlier draft identifier `aar.routing-plan.v2` is intentionally incompatible because it cannot record execution receipts. `ledger_phase` is `planning`, `active`, or `finalized`.
 
-Every node must contain the full work-unit contract, `executor_id`, enumerated requirements, selection record, `lifecycle_state`, nullable `dispatch`, and nullable `result`. Node transitions are:
+For `luna_max_only`, `runtime.available_pairs` becomes an immutable dispatch-time catalog snapshot immediately before the first spawn event. A ledger containing any dispatch event also records `runtime.catalog_snapshot: {captured_at, evidence_ref, available_pairs_sha256}`; `captured_at` is an ISO 8601 date or timezone-aware timestamp, `evidence_ref` identifies the collaboration-tool catalog observation, and the lowercase digest is computed by the validator over the normalized catalog contents. Preserve this snapshot in the finalized ledger even if the live catalog later changes; an accepted exact receipt is historical execution evidence and must not be invalidated by overwriting the snapshot during final reporting. If availability changes before an unspawned node is attempted, leave it unspawned and create a newly validated ledger for any later resume rather than mixing catalog epochs.
+
+Every node must contain the full work-unit contract, `executor_id`, enumerated requirements, selection record, `lifecycle_state`, nullable `dispatch`, and nullable `result`. Economy automatic/fallback nodes additionally contain the strict `economy_evaluation` object defined in [routing-policy.md](routing-policy.md#economy-evaluation-contract); other profiles must not add it, while `explicit_user`/`inherited` Economy nodes omit it and expose the profile bypass. Node transitions are:
 
 ```text
 planned -> dispatched -> completed
@@ -214,12 +227,15 @@ planned -> dispatch_blocked
 
 `allowed_model_effort_pairs` contains only current runtime pairs that already satisfy the node's semantic and assurance floors. An unavailable or semantically node-ineligible but globally permitted original request belongs only in `selection.requested_pair`, never in the allowed or fallback lists. Globally denied Luna `low`/`medium`/`high`, Terra `low`/`medium`, and child Ultra pairs may not appear anywhere in a certified ledger, including `selection.requested_pair`. `unavailable` and `policy_rejection` fallback reasons must be true in the declared current state.
 
+`luna_max_only` is the narrow exception to the generic availability wording: its desired singleton target may remain in `allowed_model_effort_pairs` and `selection.selected_pair` while the node is `planned`, or while a matching explicit attempt is terminally `dispatch_blocked`. It cannot become `dispatched` or `completed` unless exact Luna Max is in the runtime catalog. In this policy, the allowed list is exactly the singleton Luna Max pair, `fallback_pairs` is empty, `minimum_child_effort` is `max`, `substantive_attempts` is `1`, and `max_uses` is `1`.
+
 The dispatch record is an auditable list because a runtime rejection may precede a confirmed fallback:
 
 ```yaml
 dispatch:
   attempts:
     - attempt_index: 1
+      event_seq: 1             # required for luna_max_only
       mode: explicit | inherit_parent
       task_name:
       agent_label:
@@ -236,7 +252,13 @@ dispatch:
 
 A node represents one actual child and therefore has at most one accepted attempt. A retry that creates another child is another node. Receipt references are unique across the ledger. Rejected attempts may precede the one accepted fallback attempt; no attempt may follow acceptance.
 
-When `metric_source` is `none`, set `metric_as_of` and `evidence_id_or_window` to `null`. Otherwise both must be non-empty: `metric_as_of` is an ISO 8601 date or timezone-aware timestamp, and the evidence identifier/window contains no invisible or control characters. Do not add a plan-local policy acknowledgment: explicit provenance cannot self-authorize Luna below `xhigh` or Terra below `high`, and such a pair cannot form a V2-certified plan.
+Under `luna_max_only`, every node declares `work_unit_id`, `retry_kind`, and `retry_of`. A work unit has exactly one initial node (`retry_kind: none`, `retry_of: null`) and at most one direct transient retry. A cross-node retry must point to the completed failed initial node, whose parent-attested `failure_classification` is `transient` and whose `failure_evidence` is non-empty. It keeps the same executor and contract, preserves the original dependencies plus the initial node, sets its remaining `transient_retries` to zero, and records every retry attempt after the initial result's `event_seq`. The validator caps total dispatch attempts across the work unit and rejects an identical contract relabeled with a different work-unit ID. A substantive retry is invalid; the root must also avoid cosmetic contract edits intended only to evade work-unit identity.
+
+Luna-Max-only execution also maintains one global append-only event order across the ledger. Assign the next positive integer `event_seq` immediately after every accepted or rejected spawn attempt and every completed child result; values are unique, contiguous from 1, and never renumbered. A result sequence must follow every attempt for its node. The validator derives the one failure fence from the earliest non-`success` result or the last rejected attempt of a terminal `dispatch_blocked` node. A later spawn event is invalid unless its node is the one contract-identical direct transient retry of that earliest failed initial. A pre-fence sibling may finish after the fence, but its own later failure cannot authorize a second retry; a same-wave node dispatched after the fence is rejected.
+
+`max_uses: 1` counts an accepted Max child for one node. A rejected spawn receipt has no effective child and therefore does not consume a Max execution; this is why one rejected attempt followed by one accepted unchanged retry remains consistent. If an accepted child itself fails transiently, the single linked retry node may create the second and final accepted child for that work unit.
+
+When `metric_source` is `none`, set `metric_as_of` and `evidence_id_or_window` to `null`. Otherwise both must be non-empty: `metric_as_of` is an ISO 8601 date or timezone-aware timestamp, and the evidence identifier/window contains no invisible or control characters. Economy uses `community_prior`/`none` only for a declared qualitative order; `runtime`/`local_telemetry` require quantitative mode, a complete candidate set, and a full parent estimate bound to the actual parent pair. Candidate and parent references are unique records under `evidence_id_or_window#...`; all formula inputs have at most six decimal places. Do not add a plan-local policy acknowledgment: explicit provenance cannot self-authorize Luna below `xhigh` or Terra below `high`, and such a pair cannot form a V2-certified plan.
 
 `nodes` represent planned child slots and their dispatch history. Parent-local steps are not counted as children. `wave` supplies the proposed dispatch grouping; dependencies must point to earlier waves.
 

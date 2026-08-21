@@ -50,6 +50,7 @@ def accepted_explicit_dispatch(
     *,
     confirmation_status: str | None = None,
     receipt_ref: str = "spawn_agent:agent-001",
+    event_seq: int = 1,
 ) -> dict[str, object]:
     selected_pair = selected or node["selection"]["selected_pair"]  # type: ignore[index]
     origin = node["selection"]["origin"]  # type: ignore[index]
@@ -62,6 +63,7 @@ def accepted_explicit_dispatch(
         "attempts": [
             {
                 "attempt_index": 1,
+                "event_seq": event_seq,
                 "mode": "explicit",
                 "task_name": f"{task_slug(selected_pair['model'])}_{selected_pair['effort']}_{node_id}_a1",
                 "agent_label": f"{role} ({selected_pair['model']}, {selected_pair['effort']})",
@@ -79,18 +81,38 @@ def accepted_explicit_dispatch(
     }
 
 
-def complete_node_with_explicit_dispatch(node: dict[str, object]) -> None:
-    dispatch = accepted_explicit_dispatch(node)
+def complete_node_with_explicit_dispatch(
+    node: dict[str, object],
+    *,
+    receipt_ref: str = "spawn_agent:agent-001",
+    dispatch_event_seq: int = 1,
+    result_event_seq: int = 2,
+) -> None:
+    dispatch = accepted_explicit_dispatch(
+        node,
+        receipt_ref=receipt_ref,
+        event_seq=dispatch_event_seq,
+    )
     attempt = dispatch["attempts"][0]  # type: ignore[index]
     node["lifecycle_state"] = "completed"
     node["dispatch"] = dispatch
     node["result"] = {
         "status": "success",
+        "event_seq": result_event_seq,
+        "failure_classification": "none",
+        "failure_evidence": [],
         "dispatch_attempt": 1,
         "agent_label": attempt["agent_label"],
         "assigned_pair_echo": copy.deepcopy(attempt["effective_pair"]),
         "confirmation_status_echo": attempt["confirmation_status"],
     }
+
+
+def mark_transient_failure(node: dict[str, object], evidence: str = "One-off process termination.") -> None:
+    result = node["result"]  # type: ignore[assignment]
+    result["status"] = "failed"  # type: ignore[index]
+    result["failure_classification"] = "transient"  # type: ignore[index]
+    result["failure_evidence"] = [evidence]  # type: ignore[index]
 
 
 def base_node() -> dict[str, object]:
@@ -155,6 +177,7 @@ def base_plan() -> dict[str, object]:
         "schema_version": "aar.routing-ledger.v2",
         "ledger_phase": "planning",
         "profile": "balanced",
+        "child_policy": "adaptive",
         "metric_source": "none",
         "metric_as_of": None,
         "evidence_id_or_window": None,
@@ -170,6 +193,167 @@ def base_plan() -> dict[str, object]:
         "runtime": {"max_concurrent_children": 3, "available_pairs": available},
         "nodes": [base_node()],
     }
+
+
+def luna_max_only_plan() -> dict[str, object]:
+    plan = base_plan()
+    plan["child_policy"] = "luna_max_only"
+    plan["runtime"]["catalog_snapshot"] = {  # type: ignore[index]
+        "captured_at": "2026-08-21T00:00:00+08:00",
+        "evidence_ref": "collaboration-tool:model-catalog:test-snapshot",
+        "available_pairs_sha256": MODULE._runtime_catalog_sha256(  # type: ignore[attr-defined]
+            plan["runtime"]["available_pairs"]  # type: ignore[index]
+        ),
+    }
+    node = plan["nodes"][0]  # type: ignore[index]
+    luna_max = pair("gpt-5.6-luna", "luna", "max")
+    node["requirements"] = {  # type: ignore[index]
+        "required_integrator_class": "general",
+        "minimum_child_effort": "max",
+        "minimum_integrator_effort": "high",
+        "allowed_model_effort_pairs": [copy.deepcopy(luna_max)],
+        "fallback_pairs": [],
+    }
+    node["selection"] = {  # type: ignore[index]
+        "origin": "automatic",
+        "requested_pair": None,
+        "selected_pair": copy.deepcopy(luna_max),
+        "fallback_reason": None,
+    }
+    node["attempt_budget"] = {  # type: ignore[index]
+        "transient_retries": 1,
+        "substantive_attempts": 1,
+        "max_uses": 1,
+    }
+    node["work_unit_id"] = "json_convert"
+    node["retry_of"] = None
+    node["retry_kind"] = "none"
+    return plan
+
+
+def economy_candidates(node: dict[str, object]) -> list[dict[str, str]]:
+    origin = node["selection"]["origin"]  # type: ignore[index]
+    field_name = "fallback_pairs" if origin == "fallback" else "allowed_model_effort_pairs"
+    return copy.deepcopy(node["requirements"][field_name])  # type: ignore[index,return-value]
+
+
+def economy_estimate(
+    candidate: dict[str, str],
+    initial_cost: float,
+    *,
+    sample_size: int = 12,
+    evidence_window: str = "economy-regression-window-001",
+    evidence_subject: str = "candidate",
+) -> dict[str, object]:
+    retry_probability = 0.1
+    retry_cost = initial_cost
+    rework_probability = 0.05
+    rework_cost = initial_cost * 1.5
+    review_cost = 0.1
+    escalation_probability = 0.02
+    escalation_cost = initial_cost * 2.0
+    coordination_cost = 0.1
+    expected_total = round(
+        initial_cost
+        + retry_probability * retry_cost
+        + rework_probability * rework_cost
+        + review_cost
+        + escalation_probability * escalation_cost
+        + coordination_cost,
+        6,
+    )
+    return {
+        "pair": copy.deepcopy(candidate),
+        "sample_size": sample_size,
+        "evidence_ref": (
+            f"{evidence_window}#{evidence_subject}:{candidate['model']}:{candidate['effort']}"
+        ),
+        "initial_cost": initial_cost,
+        "retry_probability": retry_probability,
+        "retry_cost_if_triggered": retry_cost,
+        "rework_probability": rework_probability,
+        "rework_cost_if_triggered": rework_cost,
+        "review_cost": review_cost,
+        "escalation_probability": escalation_probability,
+        "escalation_cost_if_triggered": escalation_cost,
+        "coordination_cost": coordination_cost,
+        "expected_total_cost": expected_total,
+    }
+
+
+def attach_qualitative_economy(plan: dict[str, object]) -> None:
+    plan["profile"] = "economy"
+    for node in plan["nodes"]:  # type: ignore[index]
+        origin = node["selection"]["origin"]  # type: ignore[index]
+        if origin in {"explicit_user", "inherited"}:
+            node.pop("economy_evaluation", None)
+            continue
+        candidates = economy_candidates(node)
+        selected = node["selection"]["selected_pair"]  # type: ignore[index]
+        ordered = [copy.deepcopy(selected)] + [
+            candidate for candidate in candidates if candidate != selected
+        ]
+        node["economy_evaluation"] = {
+            "mode": "qualitative",
+            "formula_version": None,
+            "cost_unit": None,
+            "cohort_id": None,
+            "parent_estimate": None,
+            "candidate_estimates": [],
+            "qualitative_order": ordered,
+            "tie_break": "declared_order",
+            "delegation_decision": "delegate",
+            "rationale": "The bounded child contract is expected to save more work than its coordination overhead.",
+        }
+
+
+def attach_quantitative_economy(plan: dict[str, object]) -> None:
+    plan["profile"] = "economy"
+    plan["metric_source"] = "local_telemetry"
+    plan["metric_as_of"] = "2026-08-21T08:00:00+08:00"
+    evidence_window = "economy-regression-window-001"
+    plan["evidence_id_or_window"] = evidence_window
+    for node in plan["nodes"]:  # type: ignore[index]
+        origin = node["selection"]["origin"]  # type: ignore[index]
+        if origin in {"explicit_user", "inherited"}:
+            node.pop("economy_evaluation", None)
+            continue
+        candidates = economy_candidates(node)
+        selected = node["selection"]["selected_pair"]  # type: ignore[index]
+        ordered = [copy.deepcopy(selected)] + [
+            candidate for candidate in candidates if candidate != selected
+        ]
+        estimates = [
+            economy_estimate(candidate, 1.0 + index, evidence_window=evidence_window)
+            for index, candidate in enumerate(ordered)
+        ]
+        parent = plan["orchestration"]["parent"]  # type: ignore[index]
+        parent_pair = pair(parent["model"], parent["family"], parent["effort"])
+        parent_estimate = economy_estimate(
+            parent_pair,
+            float(len(ordered) + 2),
+            evidence_window=evidence_window,
+            evidence_subject="parent",
+        )
+        node["economy_evaluation"] = {
+            "mode": "quantitative",
+            "formula_version": "expected-total-cost-v1",
+            "cost_unit": "normalized-cost-unit",
+            "cohort_id": "same-contract-same-tool-surface",
+            "parent_estimate": parent_estimate,
+            "candidate_estimates": estimates,
+            "qualitative_order": [],
+            "tie_break": "pair_key_lexicographic",
+            "delegation_decision": "delegate",
+            "rationale": "Comparable local observations put the selected child below the parent baseline.",
+        }
+
+
+def refresh_catalog_snapshot(plan: dict[str, object]) -> None:
+    snapshot = plan["runtime"]["catalog_snapshot"]  # type: ignore[index]
+    snapshot["available_pairs_sha256"] = MODULE._runtime_catalog_sha256(  # type: ignore[index,attr-defined]
+        plan["runtime"]["available_pairs"]  # type: ignore[index]
+    )
 
 
 def error_codes(result: dict[str, object]) -> set[str]:
@@ -352,6 +536,1123 @@ class RoutingPlanValidationTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertTrue(result["valid"])
 
+    def test_child_policy_defaults_to_adaptive_for_existing_v2_ledgers(self) -> None:
+        plan = base_plan()
+        del plan["child_policy"]
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+    def test_child_policy_rejects_unknown_values(self) -> None:
+        cases = (("cheap-ish", "SCHEMA_ENUM"), ("luna-max", "SCHEMA_ENUM"), (None, "SCHEMA_TYPE"))
+        for value, expected_code in cases:
+            with self.subTest(value=value):
+                plan = base_plan()
+                plan["child_policy"] = value
+
+                code, result = validate(plan)
+
+                self.assertEqual(2, code, result)
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_luna_max_only_planning_ledger_is_valid(self) -> None:
+        code, result = validate(luna_max_only_plan())
+
+        self.assertEqual(0, code, result)
+        self.assertTrue(result["valid"])
+
+    def test_luna_max_only_requires_auditable_retry_metadata(self) -> None:
+        for field_name in ("work_unit_id", "retry_of", "retry_kind"):
+            with self.subTest(field=field_name):
+                plan = luna_max_only_plan()
+                del plan["nodes"][0][field_name]  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_RETRY_METADATA_REQUIRED", error_codes(result))
+
+    def test_luna_max_only_completed_dispatch_is_exact_and_reported(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(node)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        report = MODULE.render_routing_report(plan)
+        self.assertTrue(report.startswith("| agent |"), report)
+        self.assertIn("Child policy: `luna_max_only`", report)
+        self.assertIn("gpt-5.6-luna / max", report)
+        self.assertIn("e1 a1 accepted", report)
+        self.assertIn("success (e2)", report)
+        self.assertEqual(
+            "gpt_5_6_luna_max_json_convert_a1",
+            node["dispatch"]["attempts"][0]["task_name"],  # type: ignore[index]
+        )
+
+    def test_luna_max_only_dispatch_requires_frozen_runtime_snapshot(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        del plan["runtime"]["catalog_snapshot"]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(plan["nodes"][0])  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_RUNTIME_SNAPSHOT_REQUIRED", error_codes(result))
+
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        plan["runtime"]["catalog_snapshot"]["available_pairs_sha256"] = "0" * 64  # type: ignore[index]
+        complete_node_with_explicit_dispatch(plan["nodes"][0])  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_RUNTIME_SNAPSHOT_DIGEST_MISMATCH", error_codes(result))
+
+    def test_luna_max_only_is_orthogonal_to_profile(self) -> None:
+        for profile in ("balanced", "latency", "economy", "quality"):
+            with self.subTest(profile=profile):
+                plan = luna_max_only_plan()
+                plan["profile"] = profile
+                if profile == "economy":
+                    attach_qualitative_economy(plan)
+
+                code, result = validate(plan)
+
+                self.assertEqual(0, code, result)
+                selected = plan["nodes"][0]["selection"]["selected_pair"]  # type: ignore[index]
+                self.assertEqual(pair("gpt-5.6-luna", "luna", "max"), selected)
+                if profile in {"latency", "economy"}:
+                    self.assertIn("QUALITATIVE_OPTIMIZATION_ONLY", warning_codes(result))
+
+    def test_luna_max_only_rejects_non_luna_max_pairs_at_every_layer(self) -> None:
+        foreign = pair("gpt-5.6-terra", "terra", "high")
+        locations = (
+            "allowed",
+            "fallback",
+            "selected",
+            "requested",
+            "dispatch_requested",
+            "effective",
+            "echo",
+        )
+        for location in locations:
+            with self.subTest(location=location):
+                plan = luna_max_only_plan()
+                node = plan["nodes"][0]  # type: ignore[index]
+                if location == "allowed":
+                    node["requirements"]["allowed_model_effort_pairs"].append(  # type: ignore[index]
+                        copy.deepcopy(foreign)
+                    )
+                elif location == "fallback":
+                    node["requirements"]["fallback_pairs"] = [copy.deepcopy(foreign)]  # type: ignore[index]
+                elif location == "selected":
+                    node["selection"]["selected_pair"] = copy.deepcopy(foreign)  # type: ignore[index]
+                elif location == "requested":
+                    node["selection"].update(  # type: ignore[index]
+                        {"origin": "explicit_user", "requested_pair": copy.deepcopy(foreign)}
+                    )
+                else:
+                    plan["ledger_phase"] = "finalized"
+                    complete_node_with_explicit_dispatch(node)
+                    attempt = node["dispatch"]["attempts"][0]  # type: ignore[index]
+                    if location == "dispatch_requested":
+                        attempt["requested_pair"] = copy.deepcopy(foreign)
+                    elif location == "effective":
+                        attempt["effective_pair"] = copy.deepcopy(foreign)
+                    else:
+                        node["result"]["assigned_pair_echo"] = copy.deepcopy(foreign)  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_PAIR_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_rejects_luna_xhigh_and_other_max_families(self) -> None:
+        candidates = (
+            pair("gpt-5.6-luna", "luna", "xhigh"),
+            pair("gpt-5.6-terra", "terra", "max"),
+            pair("gpt-5.6-sol", "sol", "max"),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                plan = luna_max_only_plan()
+                node = plan["nodes"][0]  # type: ignore[index]
+                node["requirements"]["allowed_model_effort_pairs"] = [  # type: ignore[index]
+                    copy.deepcopy(candidate)
+                ]
+                node["selection"]["selected_pair"] = copy.deepcopy(candidate)  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_PAIR_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_forbids_fallback_even_to_luna_max(self) -> None:
+        plan = luna_max_only_plan()
+        node = plan["nodes"][0]  # type: ignore[index]
+        luna_max = copy.deepcopy(node["selection"]["selected_pair"])  # type: ignore[index]
+        node["requirements"]["fallback_pairs"] = [luna_max]  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FALLBACK_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_forbids_inherited_dispatch(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "active"
+        node = plan["nodes"][0]  # type: ignore[index]
+        node["lifecycle_state"] = "dispatched"
+        node["dispatch"] = accepted_explicit_dispatch(node)
+        attempt = node["dispatch"]["attempts"][0]  # type: ignore[index]
+        attempt.update(
+            {
+                "mode": "inherit_parent",
+                "fork_turns": "all",
+                "model": None,
+                "reasoning_effort": None,
+            }
+        )
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_EXPLICIT_DISPATCH_REQUIRED", error_codes(result))
+        self.assertIn("CHILD_POLICY_EXPLICIT_ARGUMENTS_REQUIRED", error_codes(result))
+
+    def test_luna_max_only_requires_both_exact_spawn_arguments(self) -> None:
+        for field_name in ("model", "reasoning_effort"):
+            with self.subTest(field=field_name):
+                plan = luna_max_only_plan()
+                plan["ledger_phase"] = "active"
+                node = plan["nodes"][0]  # type: ignore[index]
+                node["lifecycle_state"] = "dispatched"
+                node["dispatch"] = accepted_explicit_dispatch(node)
+                node["dispatch"]["attempts"][0][field_name] = None  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_EXPLICIT_ARGUMENTS_REQUIRED", error_codes(result))
+
+    def test_luna_max_only_cannot_dispatch_when_runtime_pair_is_unavailable(self) -> None:
+        plan = luna_max_only_plan()
+        plan["runtime"]["available_pairs"] = [  # type: ignore[index]
+            item
+            for item in plan["runtime"]["available_pairs"]  # type: ignore[index]
+            if not (item["model"] == "gpt-5.6-luna" and item["effort"] == "max")
+        ]
+        refresh_catalog_snapshot(plan)
+        plan["ledger_phase"] = "finalized"
+        complete_node_with_explicit_dispatch(plan["nodes"][0])  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_LUNA_MAX_UNAVAILABLE", error_codes(result))
+
+    def test_luna_max_only_can_stay_entirely_in_parent_when_unavailable(self) -> None:
+        plan = luna_max_only_plan()
+        plan["nodes"] = []
+        plan["runtime"]["available_pairs"] = [  # type: ignore[index]
+            item
+            for item in plan["runtime"]["available_pairs"]  # type: ignore[index]
+            if not (item["model"] == "gpt-5.6-luna" and item["effort"] == "max")
+        ]
+        refresh_catalog_snapshot(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+
+    def test_luna_max_only_can_record_an_unavailable_target_as_planned(self) -> None:
+        plan = luna_max_only_plan()
+        plan["runtime"]["available_pairs"] = [  # type: ignore[index]
+            item
+            for item in plan["runtime"]["available_pairs"]  # type: ignore[index]
+            if not (item["model"] == "gpt-5.6-luna" and item["effort"] == "max")
+        ]
+        refresh_catalog_snapshot(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+
+    def test_luna_max_only_runtime_rejection_can_finalize_as_dispatch_blocked(self) -> None:
+        plan = luna_max_only_plan()
+        plan["runtime"]["available_pairs"] = [  # type: ignore[index]
+            item
+            for item in plan["runtime"]["available_pairs"]  # type: ignore[index]
+            if not (item["model"] == "gpt-5.6-luna" and item["effort"] == "max")
+        ]
+        refresh_catalog_snapshot(plan)
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        dispatch = accepted_explicit_dispatch(node)
+        attempt = dispatch["attempts"][0]  # type: ignore[index]
+        attempt.update(
+            {
+                "receipt_status": "rejected",
+                "receipt_ref": "spawn_agent:error-luna-max-unavailable",
+                "effective_pair": None,
+                "confirmation_status": "runtime-rejected",
+            }
+        )
+        dispatch["effective_attempt"] = None
+        node["lifecycle_state"] = "dispatch_blocked"
+        node["dispatch"] = dispatch
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        self.assertIn("runtime-rejected", MODULE.render_routing_report(plan))
+
+    def test_luna_max_only_rejected_dispatch_can_retry_once_then_succeed(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        dispatch = accepted_explicit_dispatch(
+            node,
+            receipt_ref="spawn_agent:agent-after-transient-retry",
+        )
+        accepted = dispatch["attempts"][0]  # type: ignore[index]
+        rejected = copy.deepcopy(accepted)
+        rejected.update(
+            {
+                "receipt_status": "rejected",
+                "receipt_ref": "spawn_agent:error-transient-dispatch",
+                "effective_pair": None,
+                "confirmation_status": "runtime-rejected",
+            }
+        )
+        accepted.update(
+            {
+                "attempt_index": 2,
+                "event_seq": 2,
+                "task_name": "gpt_5_6_luna_max_json_convert_a2",
+            }
+        )
+        dispatch["attempts"] = [rejected, accepted]
+        dispatch["effective_attempt"] = 2
+        node["lifecycle_state"] = "completed"
+        node["dispatch"] = dispatch
+        node["result"] = {
+            "status": "success",
+            "event_seq": 3,
+            "failure_classification": "none",
+            "failure_evidence": [],
+            "dispatch_attempt": 2,
+            "agent_label": accepted["agent_label"],
+            "assigned_pair_echo": copy.deepcopy(accepted["effective_pair"]),
+            "confirmation_status_echo": accepted["confirmation_status"],
+        }
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+
+    def test_luna_max_only_allows_one_declared_cross_node_transient_retry(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-initial-failed",
+        )
+        mark_transient_failure(initial)
+
+        retry = copy.deepcopy(initial)
+        retry.update(
+            {
+                "id": "json_convert_retry",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "retry_of": "json_convert",
+                "retry_kind": "transient",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        retry["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            retry,
+            receipt_ref="spawn_agent:agent-transient-retry",
+            dispatch_event_seq=3,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(retry)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        report = MODULE.render_routing_report(plan)
+        self.assertIn("failed/transient (e2)", report)
+        self.assertIn("success (e4)", report)
+
+    def test_luna_max_only_retry_must_dispatch_after_initial_failure_result(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-initial-failed-late",
+            dispatch_event_seq=1,
+            result_event_seq=4,
+        )
+        mark_transient_failure(initial)
+
+        retry = copy.deepcopy(initial)
+        retry.update(
+            {
+                "id": "json_convert_retry",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "retry_of": "json_convert",
+                "retry_kind": "transient",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        retry["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            retry,
+            receipt_ref="spawn_agent:agent-premature-retry",
+            dispatch_event_seq=2,
+            result_event_seq=3,
+        )
+        plan["nodes"].append(retry)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_RETRY_EVENT_ORDER", error_codes(result))
+
+    def test_luna_max_only_only_earliest_failure_can_authorize_retry(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        first = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            first,
+            receipt_ref="spawn_agent:agent-first-failure",
+            dispatch_event_seq=1,
+            result_event_seq=3,
+        )
+        mark_transient_failure(first)
+
+        sibling = copy.deepcopy(first)
+        sibling.update(
+            {
+                "id": "schema_inventory",
+                "executor_id": "executor_schema_inventory",
+                "wave": 0,
+                "depends_on": [],
+                "objective": "Inventory an independent bounded schema directory.",
+                "why_delegate": "The directory has an exact manifest oracle.",
+                "work_unit_id": "schema_inventory",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            sibling,
+            receipt_ref="spawn_agent:agent-second-failure",
+            dispatch_event_seq=2,
+            result_event_seq=4,
+        )
+        mark_transient_failure(sibling)
+
+        sibling_retry = copy.deepcopy(sibling)
+        sibling_retry.update(
+            {
+                "id": "schema_inventory_retry",
+                "wave": 1,
+                "depends_on": ["schema_inventory"],
+                "retry_of": "schema_inventory",
+                "retry_kind": "transient",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        sibling_retry["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            sibling_retry,
+            receipt_ref="spawn_agent:agent-second-failure-retry",
+            dispatch_event_seq=5,
+            result_event_seq=6,
+        )
+        plan["nodes"].extend([sibling, sibling_retry])  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAIL_STOP_DISPATCH_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_retry_requires_transient_failure_evidence(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-validation-failed",
+        )
+        initial["result"].update(  # type: ignore[index]
+            {
+                "status": "failed",
+                "failure_classification": "validation_failure",
+                "failure_evidence": ["The deterministic schema assertion failed."],
+            }
+        )
+
+        retry = copy.deepcopy(initial)
+        retry.update(
+            {
+                "id": "json_convert_retry",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "retry_of": "json_convert",
+                "retry_kind": "transient",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        retry["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            retry,
+            receipt_ref="spawn_agent:agent-invalid-retry",
+            dispatch_event_seq=3,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(retry)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_RETRY_PRIOR_NOT_TRANSIENT", error_codes(result))
+
+    def test_luna_max_only_dependency_must_finish_before_downstream_dispatch(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        upstream = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            upstream,
+            receipt_ref="spawn_agent:agent-upstream",
+            dispatch_event_seq=1,
+            result_event_seq=3,
+        )
+
+        downstream = copy.deepcopy(upstream)
+        downstream.update(
+            {
+                "id": "schema_summary",
+                "executor_id": "executor_schema_summary",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "objective": "Summarize the accepted conversion into a bounded schema report.",
+                "why_delegate": "The summary has an exact schema oracle.",
+                "work_unit_id": "schema_summary",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            downstream,
+            receipt_ref="spawn_agent:agent-premature-downstream",
+            dispatch_event_seq=2,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(downstream)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_DEPENDENCY_EVENT_ORDER", error_codes(result))
+
+    def test_luna_max_only_dependency_ready_event_order_is_valid(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        upstream = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            upstream,
+            receipt_ref="spawn_agent:agent-upstream",
+            dispatch_event_seq=1,
+            result_event_seq=2,
+        )
+
+        downstream = copy.deepcopy(upstream)
+        downstream.update(
+            {
+                "id": "schema_summary",
+                "executor_id": "executor_schema_summary",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "objective": "Summarize the accepted conversion into a bounded schema report.",
+                "why_delegate": "The summary has an exact schema oracle.",
+                "work_unit_id": "schema_summary",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            downstream,
+            receipt_ref="spawn_agent:agent-ready-downstream",
+            dispatch_event_seq=3,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(downstream)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+
+    def test_luna_max_only_failure_blocks_disguised_later_work_unit(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-initial-failed",
+        )
+        mark_transient_failure(initial)
+
+        disguised = copy.deepcopy(initial)
+        disguised.update(
+            {
+                "id": "metadata_extract",
+                "executor_id": "executor_metadata_extract",
+                "wave": 1,
+                "depends_on": [],
+                "objective": "Extract the same bounded records into a normalized report.",
+                "why_delegate": "The normalized report has an exact schema oracle.",
+                "work_unit_id": "metadata_extract",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            disguised,
+            receipt_ref="spawn_agent:agent-disguised-follow-up",
+            dispatch_event_seq=3,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(disguised)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAIL_STOP_DISPATCH_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_failed_retry_seals_all_later_waves(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-initial-failed",
+        )
+        mark_transient_failure(initial)
+
+        retry = copy.deepcopy(initial)
+        retry.update(
+            {
+                "id": "json_convert_retry",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "retry_of": "json_convert",
+                "retry_kind": "transient",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        retry["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            retry,
+            receipt_ref="spawn_agent:agent-transient-retry-failed",
+            dispatch_event_seq=3,
+            result_event_seq=4,
+        )
+        mark_transient_failure(retry)
+
+        later = copy.deepcopy(initial)
+        later.update(
+            {
+                "id": "schema_summary",
+                "executor_id": "executor_schema_summary",
+                "wave": 2,
+                "depends_on": [],
+                "objective": "Summarize a separate bounded schema inventory.",
+                "why_delegate": "The inventory has an exact count oracle.",
+                "work_unit_id": "schema_summary",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            later,
+            receipt_ref="spawn_agent:agent-post-retry-follow-up",
+            dispatch_event_seq=5,
+            result_event_seq=6,
+        )
+        plan["nodes"].extend([retry, later])  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAIL_STOP_DISPATCH_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_same_wave_precommitted_children_can_finish(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-parallel-failed",
+            dispatch_event_seq=1,
+            result_event_seq=3,
+        )
+        mark_transient_failure(initial)
+
+        sibling = copy.deepcopy(initial)
+        sibling.update(
+            {
+                "id": "schema_inventory",
+                "executor_id": "executor_schema_inventory",
+                "wave": 0,
+                "depends_on": [],
+                "objective": "Inventory an independent bounded schema directory.",
+                "why_delegate": "The directory has an exact manifest oracle.",
+                "work_unit_id": "schema_inventory",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            sibling,
+            receipt_ref="spawn_agent:agent-parallel-success",
+            dispatch_event_seq=2,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(sibling)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+
+    def test_luna_max_only_same_wave_dispatch_after_failure_is_rejected(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-same-wave-failed",
+            dispatch_event_seq=1,
+            result_event_seq=2,
+        )
+        mark_transient_failure(initial)
+
+        late_sibling = copy.deepcopy(initial)
+        late_sibling.update(
+            {
+                "id": "late_schema_inventory",
+                "executor_id": "executor_late_schema_inventory",
+                "wave": 0,
+                "depends_on": [],
+                "objective": "Inventory a separate bounded schema directory.",
+                "why_delegate": "The directory has an exact manifest oracle.",
+                "work_unit_id": "late_schema_inventory",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            late_sibling,
+            receipt_ref="spawn_agent:agent-same-wave-after-failure",
+            dispatch_event_seq=3,
+            result_event_seq=4,
+        )
+        plan["nodes"].append(late_sibling)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAIL_STOP_DISPATCH_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_requires_event_sequence_on_attempts_and_results(self) -> None:
+        for location in ("attempt", "result"):
+            with self.subTest(location=location):
+                plan = luna_max_only_plan()
+                plan["ledger_phase"] = "finalized"
+                node = plan["nodes"][0]  # type: ignore[index]
+                complete_node_with_explicit_dispatch(node)
+                if location == "attempt":
+                    del node["dispatch"]["attempts"][0]["event_seq"]  # type: ignore[index]
+                else:
+                    del node["result"]["event_seq"]  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_EVENT_SEQUENCE_REQUIRED", error_codes(result))
+
+    def test_luna_max_only_requires_failure_classification_and_evidence(self) -> None:
+        for field_name in ("failure_classification", "failure_evidence"):
+            with self.subTest(field=field_name):
+                plan = luna_max_only_plan()
+                plan["ledger_phase"] = "finalized"
+                node = plan["nodes"][0]  # type: ignore[index]
+                complete_node_with_explicit_dispatch(node)
+                del node["result"][field_name]  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_FAILURE_ATTESTATION_REQUIRED", error_codes(result))
+
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(node)
+        node["result"]["status"] = "failed"  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAILURE_CLASSIFICATION_INVALID", error_codes(result))
+        self.assertIn("CHILD_POLICY_FAILURE_EVIDENCE_REQUIRED", error_codes(result))
+
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(node)
+        node["result"]["failure_evidence"] = ["Not a failure."]  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAILURE_EVIDENCE_INVALID", error_codes(result))
+
+    def test_luna_max_only_failure_evidence_must_be_visible(self) -> None:
+        for invisible_text in ("\u200b", "\u2800"):
+            with self.subTest(evidence=repr(invisible_text)):
+                plan = luna_max_only_plan()
+                plan["ledger_phase"] = "finalized"
+                node = plan["nodes"][0]  # type: ignore[index]
+                complete_node_with_explicit_dispatch(node)
+                node["result"].update(  # type: ignore[index]
+                    {
+                        "status": "failed",
+                        "failure_classification": "transient",
+                        "failure_evidence": [invisible_text],
+                    }
+                )
+
+                code, result = validate(plan)
+
+                self.assertEqual(2, code, result)
+                self.assertIn("SCHEMA_PATTERN", error_codes(result))
+
+    def test_luna_max_only_event_sequence_is_unique_contiguous_and_ordered(self) -> None:
+        cases = (
+            ("duplicate", 1, 1, "CHILD_POLICY_EVENT_SEQUENCE_DUPLICATE"),
+            ("gap", 1, 3, "CHILD_POLICY_EVENT_SEQUENCE_GAP"),
+            ("result_before_dispatch", 2, 1, "CHILD_POLICY_RESULT_EVENT_ORDER"),
+        )
+        for name, dispatch_sequence, result_sequence, expected_code in cases:
+            with self.subTest(case=name):
+                plan = luna_max_only_plan()
+                plan["ledger_phase"] = "finalized"
+                node = plan["nodes"][0]  # type: ignore[index]
+                complete_node_with_explicit_dispatch(
+                    node,
+                    dispatch_event_seq=dispatch_sequence,
+                    result_event_seq=result_sequence,
+                )
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_luna_max_only_dispatch_blocked_seals_later_waves(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        blocked = plan["nodes"][0]  # type: ignore[index]
+        dispatch = accepted_explicit_dispatch(blocked)
+        attempt = dispatch["attempts"][0]  # type: ignore[index]
+        attempt.update(
+            {
+                "receipt_status": "rejected",
+                "receipt_ref": "spawn_agent:error-runtime-rejected",
+                "effective_pair": None,
+                "confirmation_status": "runtime-rejected",
+            }
+        )
+        dispatch["effective_attempt"] = None
+        blocked["lifecycle_state"] = "dispatch_blocked"
+        blocked["dispatch"] = dispatch
+
+        later = copy.deepcopy(blocked)
+        later.update(
+            {
+                "id": "schema_inventory",
+                "executor_id": "executor_schema_inventory",
+                "wave": 1,
+                "depends_on": [],
+                "objective": "Inventory an independent bounded schema directory.",
+                "why_delegate": "The directory has an exact manifest oracle.",
+                "work_unit_id": "schema_inventory",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        complete_node_with_explicit_dispatch(
+            later,
+            receipt_ref="spawn_agent:agent-after-runtime-rejection",
+            dispatch_event_seq=2,
+            result_event_seq=3,
+        )
+        plan["nodes"].append(later)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_FAIL_STOP_DISPATCH_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_failure_may_leave_later_nodes_unspawned(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "active"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-initial-failed",
+        )
+        mark_transient_failure(initial)
+
+        planned = copy.deepcopy(initial)
+        planned.update(
+            {
+                "id": "schema_inventory",
+                "executor_id": "executor_schema_inventory",
+                "wave": 1,
+                "depends_on": [],
+                "objective": "Inventory an independent bounded schema directory.",
+                "why_delegate": "The directory has an exact manifest oracle.",
+                "work_unit_id": "schema_inventory",
+                "retry_of": None,
+                "retry_kind": "none",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        plan["nodes"].append(planned)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+
+    def test_luna_max_only_rejects_cross_node_substantive_rework(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        initial = plan["nodes"][0]  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            initial,
+            receipt_ref="spawn_agent:agent-initial-failed",
+        )
+        mark_transient_failure(initial)
+
+        rework = copy.deepcopy(initial)
+        rework.update(
+            {
+                "id": "json_convert_rework",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "retry_of": "json_convert",
+                "retry_kind": "substantive",
+                "lifecycle_state": "planned",
+                "dispatch": None,
+                "result": None,
+            }
+        )
+        rework["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        complete_node_with_explicit_dispatch(
+            rework,
+            receipt_ref="spawn_agent:agent-substantive-rework",
+        )
+        plan["nodes"].append(rework)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_SUBSTANTIVE_RETRY_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_rejects_duplicate_initial_nodes_for_one_work_unit(self) -> None:
+        plan = luna_max_only_plan()
+        second = copy.deepcopy(plan["nodes"][0])  # type: ignore[index]
+        second.update(
+            {
+                "id": "json_convert_again",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+            }
+        )
+        plan["nodes"].append(second)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_WORK_UNIT_INITIAL_INVALID", error_codes(result))
+
+    def test_luna_max_only_cannot_rename_an_identical_contract_as_a_new_work_unit(self) -> None:
+        plan = luna_max_only_plan()
+        disguised_rework = copy.deepcopy(plan["nodes"][0])  # type: ignore[index]
+        disguised_rework.update(
+            {
+                "id": "json_convert_disguised",
+                "wave": 1,
+                "depends_on": ["json_convert"],
+                "work_unit_id": "json_convert_disguised",
+            }
+        )
+        plan["nodes"].append(disguised_rework)  # type: ignore[union-attr]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_WORK_UNIT_ID_CHANGED", error_codes(result))
+
+    def test_luna_max_only_rejects_more_than_one_transient_retry(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        dispatch = accepted_explicit_dispatch(node)
+        first = dispatch["attempts"][0]  # type: ignore[index]
+        attempts = []
+        for attempt_index in (1, 2, 3):
+            attempt = copy.deepcopy(first)
+            attempt.update(
+                {
+                    "attempt_index": attempt_index,
+                    "event_seq": attempt_index,
+                    "task_name": f"gpt_5_6_luna_max_json_convert_a{attempt_index}",
+                    "receipt_status": "rejected",
+                    "receipt_ref": f"spawn_agent:error-transient-{attempt_index}",
+                    "effective_pair": None,
+                    "confirmation_status": "runtime-rejected",
+                }
+            )
+            attempts.append(attempt)
+        dispatch["attempts"] = attempts
+        dispatch["effective_attempt"] = None
+        node["lifecycle_state"] = "dispatch_blocked"
+        node["dispatch"] = dispatch
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_ATTEMPT_BUDGET_EXCEEDED", error_codes(result))
+
+    def test_luna_max_only_dispatch_history_respects_declared_zero_retry_budget(self) -> None:
+        plan = luna_max_only_plan()
+        plan["ledger_phase"] = "finalized"
+        node = plan["nodes"][0]  # type: ignore[index]
+        node["attempt_budget"]["transient_retries"] = 0  # type: ignore[index]
+        dispatch = accepted_explicit_dispatch(node)
+        first = dispatch["attempts"][0]  # type: ignore[index]
+        attempts = []
+        for attempt_index in (1, 2):
+            attempt = copy.deepcopy(first)
+            attempt.update(
+                {
+                    "attempt_index": attempt_index,
+                    "event_seq": attempt_index,
+                    "task_name": f"gpt_5_6_luna_max_json_convert_a{attempt_index}",
+                    "receipt_status": "rejected",
+                    "receipt_ref": f"spawn_agent:error-transient-{attempt_index}",
+                    "effective_pair": None,
+                    "confirmation_status": "runtime-rejected",
+                }
+            )
+            attempts.append(attempt)
+        dispatch["attempts"] = attempts
+        dispatch["effective_attempt"] = None
+        node["lifecycle_state"] = "dispatch_blocked"
+        node["dispatch"] = dispatch
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_ATTEMPT_BUDGET_EXCEEDED", error_codes(result))
+
+    def test_luna_max_only_requires_one_declared_max_use(self) -> None:
+        plan = luna_max_only_plan()
+        plan["nodes"][0]["attempt_budget"]["max_uses"] = 0  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_MAX_BUDGET_INVALID", error_codes(result))
+
+    def test_luna_max_only_forbids_substantive_luna_rework_loop(self) -> None:
+        plan = luna_max_only_plan()
+        plan["nodes"][0]["attempt_budget"]["substantive_attempts"] = 2  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("CHILD_POLICY_SUBSTANTIVE_RETRY_FORBIDDEN", error_codes(result))
+
+    def test_luna_max_only_keeps_unbounded_or_non_structured_work_in_parent(self) -> None:
+        mutations = (
+            ("work_class", "general"),
+            ("context_scope", "cross_system"),
+            ("oracle", "weak"),
+            ("access_mode", "external_write"),
+            ("role", "diagnostician"),
+        )
+        for field_name, value in mutations:
+            with self.subTest(field=field_name):
+                plan = luna_max_only_plan()
+                plan["nodes"][0][field_name] = value  # type: ignore[index]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("CHILD_POLICY_NODE_MUST_STAY_PARENT", error_codes(result))
+
     def test_complete_node_contract_is_required(self) -> None:
         for field_name in sorted(REQUIRED_NODE_FIELDS):
             with self.subTest(field=field_name):
@@ -482,6 +1783,373 @@ class RoutingPlanValidationTests(unittest.TestCase):
 
                 self.assertEqual(3, code, result)
                 self.assertIn(expected_code, error_codes(result))
+
+    def test_economy_requires_an_auditable_evaluation_for_ranked_nodes(self) -> None:
+        plan = base_plan()
+        plan["profile"] = "economy"
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_EVALUATION_REQUIRED", error_codes(result))
+
+    def test_qualitative_economy_records_complete_order_without_cost_claim(self) -> None:
+        plan = base_plan()
+        attach_qualitative_economy(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        self.assertIn("ECONOMY_QUALITATIVE_EVALUATION", warning_codes(result))
+        self.assertIn("QUALITATIVE_OPTIMIZATION_ONLY", warning_codes(result))
+        report = MODULE.render_routing_report(plan)
+        self.assertIn("Profile: `economy`", report)
+        self.assertIn("Metric source: `none`", report)
+        self.assertIn("Economy decisions:", report)
+        self.assertIn("qualitative", report)
+
+    def test_qualitative_economy_rejects_comparable_metric_sources(self) -> None:
+        for source in ("runtime", "local_telemetry"):
+            with self.subTest(source=source):
+                plan = base_plan()
+                attach_qualitative_economy(plan)
+                plan["metric_source"] = source
+                plan["metric_as_of"] = "2026-08-21T08:00:00+08:00"
+                plan["evidence_id_or_window"] = "economy-regression-window-001"
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("ECONOMY_QUALITATIVE_SOURCE_INVALID", error_codes(result))
+
+    def test_qualitative_economy_requires_complete_order_and_selected_first(self) -> None:
+        for mutation, expected_code in (
+            ("missing_candidate", "ECONOMY_QUALITATIVE_CANDIDATE_SET_MISMATCH"),
+            ("selected_not_first", "ECONOMY_QUALITATIVE_SELECTED_NOT_FIRST"),
+        ):
+            with self.subTest(mutation=mutation):
+                plan = base_plan()
+                attach_qualitative_economy(plan)
+                order = plan["nodes"][0]["economy_evaluation"]["qualitative_order"]  # type: ignore[index]
+                if mutation == "missing_candidate":
+                    order.pop()
+                else:
+                    order[0], order[1] = order[1], order[0]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_quantitative_economy_recomputes_cost_and_reports_evidence(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        self.assertNotIn("ECONOMY_QUALITATIVE_EVALUATION", warning_codes(result))
+        report = MODULE.render_routing_report(plan)
+        self.assertIn("Metric source: `local_telemetry`", report)
+        self.assertIn("economy-regression-window-001", report)
+        self.assertIn("normalized-cost-unit", report)
+
+    def test_quantitative_economy_rejects_untrusted_metric_sources(self) -> None:
+        for source in ("none", "community_prior"):
+            with self.subTest(source=source):
+                plan = base_plan()
+                attach_quantitative_economy(plan)
+                plan["metric_source"] = source
+                if source == "none":
+                    plan["metric_as_of"] = None
+                    plan["evidence_id_or_window"] = None
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn("ECONOMY_QUANTITATIVE_SOURCE_INSUFFICIENT", error_codes(result))
+
+    def test_quantitative_economy_rejects_formula_mismatch(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+        estimate = plan["nodes"][0]["economy_evaluation"]["candidate_estimates"][0]  # type: ignore[index]
+        estimate["expected_total_cost"] += 0.25
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_TOTAL_MISMATCH", error_codes(result))
+
+    def test_quantitative_economy_binds_and_recomputes_parent_baseline(self) -> None:
+        for mutation, expected_code in (
+            ("pair", "ECONOMY_PARENT_PAIR_MISMATCH"),
+            ("total", "ECONOMY_PARENT_TOTAL_MISMATCH"),
+        ):
+            with self.subTest(mutation=mutation):
+                plan = base_plan()
+                attach_quantitative_economy(plan)
+                parent_estimate = plan["nodes"][0]["economy_evaluation"]["parent_estimate"]  # type: ignore[index]
+                if mutation == "pair":
+                    parent_estimate["pair"] = pair("gpt-5.6-terra", "terra", "high")
+                else:
+                    parent_estimate["expected_total_cost"] += 0.25
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_quantitative_economy_binds_unique_records_to_root_evidence_window(self) -> None:
+        for mutation, expected_code in (
+            ("foreign_window", "ECONOMY_EVIDENCE_WINDOW_MISMATCH"),
+            ("duplicate", "ECONOMY_EVIDENCE_REF_DUPLICATE"),
+        ):
+            with self.subTest(mutation=mutation):
+                plan = base_plan()
+                attach_quantitative_economy(plan)
+                evaluation = plan["nodes"][0]["economy_evaluation"]  # type: ignore[index]
+                estimates = evaluation["candidate_estimates"]
+                if mutation == "foreign_window":
+                    estimates[0]["evidence_ref"] = "another-window#candidate:luna"
+                else:
+                    estimates[1]["evidence_ref"] = estimates[0]["evidence_ref"]
+
+                code, result = validate(plan)
+
+                self.assertEqual(3, code, result)
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_quantitative_economy_rejects_non_minimum_selection(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+        evaluation = plan["nodes"][0]["economy_evaluation"]  # type: ignore[index]
+        estimates = evaluation["candidate_estimates"]
+        estimates[1] = economy_estimate(estimates[1]["pair"], 0.5)  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_SELECTED_NOT_MINIMUM", error_codes(result))
+
+    def test_quantitative_economy_rejects_non_beneficial_delegation(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+        evaluation = plan["nodes"][0]["economy_evaluation"]  # type: ignore[index]
+        selected_estimate = evaluation["candidate_estimates"][0]  # type: ignore[index]
+        parent_estimate = evaluation["parent_estimate"]
+        for field_name in (
+            "initial_cost",
+            "retry_probability",
+            "retry_cost_if_triggered",
+            "rework_probability",
+            "rework_cost_if_triggered",
+            "review_cost",
+            "escalation_probability",
+            "escalation_cost_if_triggered",
+            "coordination_cost",
+            "expected_total_cost",
+        ):
+            parent_estimate[field_name] = selected_estimate[field_name]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_DELEGATION_NOT_BENEFICIAL", error_codes(result))
+
+    def test_quantitative_economy_requires_exact_candidate_coverage(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+        plan["nodes"][0]["economy_evaluation"]["candidate_estimates"].pop()  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_CANDIDATE_SET_MISMATCH", error_codes(result))
+
+    def test_quantitative_economy_rejects_non_finite_or_negative_inputs(self) -> None:
+        cases = (
+            ("retry_probability", float("nan"), "SCHEMA_TYPE"),
+            ("coordination_cost", -0.1, "SCHEMA_VALUE"),
+            ("review_cost", 0.1234567, "SCHEMA_VALUE"),
+            ("initial_cost", 1e300, "SCHEMA_VALUE"),
+            ("initial_cost", 10**309, "SCHEMA_VALUE"),
+        )
+        for field_name, value, expected_code in cases:
+            with self.subTest(field=field_name):
+                plan = base_plan()
+                attach_quantitative_economy(plan)
+                estimate = plan["nodes"][0]["economy_evaluation"]["candidate_estimates"][0]  # type: ignore[index]
+                estimate[field_name] = value
+
+                code, result = validate(plan)
+
+                self.assertEqual(2, code, result)
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_quantitative_economy_uses_deterministic_tie_break(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+        node = plan["nodes"][0]  # type: ignore[index]
+        evaluation = node["economy_evaluation"]
+        evaluation["candidate_estimates"] = [
+            economy_estimate(candidate, 1.0) for candidate in economy_candidates(node)
+        ]
+        node["selection"]["selected_pair"] = pair("gpt-5.6-terra", "terra", "high")  # type: ignore[index]
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_SELECTED_NOT_MINIMUM", error_codes(result))
+
+    def test_quantitative_economy_does_not_treat_large_absolute_gap_as_a_tie(self) -> None:
+        plan = base_plan()
+        attach_quantitative_economy(plan)
+        node = plan["nodes"][0]  # type: ignore[index]
+        evaluation = node["economy_evaluation"]
+        candidates = economy_candidates(node)
+        evaluation["candidate_estimates"] = [
+            economy_estimate(candidates[0], 1e12 + 500.0),
+            economy_estimate(candidates[1], 1e12),
+            economy_estimate(candidates[2], 2e12),
+        ]
+        parent = plan["orchestration"]["parent"]  # type: ignore[index]
+        evaluation["parent_estimate"] = economy_estimate(
+            pair(parent["model"], parent["family"], parent["effort"]),
+            1e13,
+            evidence_subject="parent",
+        )
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_SELECTED_NOT_MINIMUM", error_codes(result))
+
+    def test_economy_explicit_selection_is_visible_as_a_profile_bypass(self) -> None:
+        plan = base_plan()
+        node = plan["nodes"][0]  # type: ignore[index]
+        node["selection"]["origin"] = "explicit_user"  # type: ignore[index]
+        node["selection"]["requested_pair"] = copy.deepcopy(  # type: ignore[index]
+            node["selection"]["selected_pair"]  # type: ignore[index]
+        )
+        attach_qualitative_economy(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        self.assertIn(
+            "ECONOMY_PROFILE_BYPASSED_BY_SELECTION_ORIGIN",
+            warning_codes(result),
+        )
+        self.assertIn("bypassed:explicit_user", MODULE.render_routing_report(plan))
+
+    def test_economy_fallback_ranks_the_complete_fallback_set(self) -> None:
+        plan = base_plan()
+        plan["runtime"]["available_pairs"] = [  # type: ignore[index]
+            candidate
+            for candidate in plan["runtime"]["available_pairs"]  # type: ignore[index]
+            if not (candidate["family"] == "luna" and candidate["effort"] == "max")
+        ]
+        node = plan["nodes"][0]  # type: ignore[index]
+        selected = pair("gpt-5.6-terra", "terra", "high")
+        node["requirements"]["fallback_pairs"] = [copy.deepcopy(selected)]  # type: ignore[index]
+        node["selection"] = {
+            "origin": "fallback",
+            "requested_pair": pair("gpt-5.6-luna", "luna", "max"),
+            "selected_pair": copy.deepcopy(selected),
+            "fallback_reason": "unavailable",
+        }
+        attach_quantitative_economy(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        estimates = node["economy_evaluation"]["candidate_estimates"]  # type: ignore[index]
+        self.assertEqual([selected], [estimate["pair"] for estimate in estimates])
+
+    def test_economy_inherited_selection_is_visible_as_a_profile_bypass(self) -> None:
+        plan = base_plan()
+        node = plan["nodes"][0]  # type: ignore[index]
+        parent_pair = pair("gpt-5.6-sol", "sol", "xhigh")
+        node["requirements"]["allowed_model_effort_pairs"].append(  # type: ignore[index]
+            copy.deepcopy(parent_pair)
+        )
+        node["selection"] = {
+            "origin": "inherited",
+            "requested_pair": None,
+            "selected_pair": copy.deepcopy(parent_pair),
+            "fallback_reason": None,
+        }
+        attach_qualitative_economy(plan)
+
+        code, result = validate(plan)
+
+        self.assertEqual(0, code, result)
+        self.assertIn(
+            "ECONOMY_PROFILE_BYPASSED_BY_SELECTION_ORIGIN",
+            warning_codes(result),
+        )
+        self.assertIn("bypassed:inherited", MODULE.render_routing_report(plan))
+
+    def test_economy_evaluation_is_rejected_under_other_profiles(self) -> None:
+        plan = base_plan()
+        attach_qualitative_economy(plan)
+        plan["profile"] = "balanced"
+
+        code, result = validate(plan)
+
+        self.assertEqual(3, code, result)
+        self.assertIn("ECONOMY_EVALUATION_UNEXPECTED", error_codes(result))
+
+    def test_economy_evaluation_schema_requires_every_cost_input(self) -> None:
+        evaluation_fields = {
+            "mode",
+            "formula_version",
+            "cost_unit",
+            "cohort_id",
+            "parent_estimate",
+            "candidate_estimates",
+            "qualitative_order",
+            "tie_break",
+            "delegation_decision",
+            "rationale",
+        }
+        estimate_fields = {
+            "pair",
+            "sample_size",
+            "evidence_ref",
+            "initial_cost",
+            "retry_probability",
+            "retry_cost_if_triggered",
+            "rework_probability",
+            "rework_cost_if_triggered",
+            "review_cost",
+            "escalation_probability",
+            "escalation_cost_if_triggered",
+            "coordination_cost",
+            "expected_total_cost",
+        }
+        for scope, fields in (
+            ("evaluation", evaluation_fields),
+            ("estimate", estimate_fields),
+            ("parent_estimate", estimate_fields),
+        ):
+            for field_name in sorted(fields):
+                with self.subTest(scope=scope, field=field_name):
+                    plan = base_plan()
+                    attach_quantitative_economy(plan)
+                    evaluation = plan["nodes"][0]["economy_evaluation"]  # type: ignore[index]
+                    if scope == "evaluation":
+                        target = evaluation
+                    elif scope == "parent_estimate":
+                        target = evaluation["parent_estimate"]
+                    else:
+                        target = evaluation["candidate_estimates"][0]  # type: ignore[index]
+                    del target[field_name]
+
+                    code, result = validate(plan)
+
+                    self.assertEqual(2, code, result)
+                    self.assertIn("SCHEMA_REQUIRED", error_codes(result))
 
     def test_unknown_state_with_child_fails_closed(self) -> None:
         plan = base_plan()
