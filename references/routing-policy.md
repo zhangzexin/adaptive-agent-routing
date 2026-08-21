@@ -13,6 +13,19 @@ This Skill adds a local conservative policy. The following are workflow rules, n
 - Sol `xhigh` is the normal deep-work preference, while Max is exceptional;
 - a fixed `strict-5.6` mapping is not supported in V2.
 
+## Child policy is separate from profile
+
+Resolve the child policy before enumerating candidates:
+
+| Invocation | Ledger value | Child candidate pool |
+| --- | --- | --- |
+| no `children=` modifier | `adaptive` | Normal semantic Sol/Terra/Luna candidates |
+| `children=luna-max` | `luna_max_only` | Exact `gpt-5.6-luna / max` only |
+
+`child_policy` qualifies candidates; `profile` ranks candidates that already qualify. The two controls are orthogonal. Existing V2 ledgers without `child_policy` are interpreted as `adaptive`, but new ledgers should record it explicitly.
+
+`luna_max_only` is a hard child boundary, not a claim that Luna Max can replace every family. Only structured, bounded, deterministic/strong-oracle, non-high-risk, non-external-write leaves may be declared as child nodes. General/open/critical work, cross-system or unknown context, high/irreversible risk, architects, diagnosticians, reviewers, and unknown-root-cause work stay in the parent. If that leaves zero nodes, the policy is still satisfied.
+
 ## Contract dimensions
 
 Classify the node before considering a model name.
@@ -78,6 +91,28 @@ requirements:
 The model names above are examples, not a permanent catalog. Build the list from the models and efforts exposed by the current collaboration tool. Every allowed pair must satisfy the node's semantic and assurance requirements before ranking begins.
 
 Do not use free-text substitutes such as `strongest available`, `equivalent`, or `next best`. If a runtime adds a new model, add it to the node's explicit list only after the runtime description establishes the relevant semantic band.
+
+For `luna_max_only`, the requirements are deliberately singular:
+
+```yaml
+child_policy: luna_max_only
+work_unit_id: json_convert
+retry_kind: none
+retry_of: null
+requirements:
+  required_integrator_class: general
+  minimum_child_effort: max
+  minimum_integrator_effort: high
+  allowed_model_effort_pairs:
+    - {model: gpt-5.6-luna, family: luna, effort: max}
+  fallback_pairs: []
+attempt_budget:
+  transient_retries: 1
+  substantive_attempts: 1
+  max_uses: 1
+```
+
+The parent and integrator remain governed by their own capability floor; the policy constrains children only. Every Luna-Max-only node must keep a stable `work_unit_id`. A single genuine transient retry uses `retry_kind: transient`, points `retry_of` to the failed initial node, preserves the same executor and contract, and has zero retry budget remaining. A new work-unit ID must never be used to disguise substantive rework.
 
 ## Choose family, then effort
 
@@ -160,6 +195,12 @@ If the parent pair or integrator class cannot be established for open/critical w
 
 Fallback repeats these steps over `fallback_pairs`; it is not a fixed family/effort chain. A globally denied pair cannot be retained even as `selection.requested_pair`; `policy_rejection` provenance is reserved for a globally permitted pair that fails the current node's semantic or assurance rules.
 
+In `luna_max_only`, do not run fallback filtering: `fallback_pairs` is empty, selection origin is never `fallback` or `inherited`, and no other family/effort pair is eligible. If exact Luna Max is absent from the runtime catalog, it may remain only as an unspawned `planned` target or the work may stay entirely in the parent; a `dispatched` or `completed` node requires current availability. If an exact explicit attempt is rejected, record it as `dispatch_blocked`. Never replace it with Terra, Sol, Luna `xhigh`, a default effort, or an unverified alias.
+
+Freeze the Luna-Max-only `runtime.available_pairs` snapshot immediately before its first spawn event, record `runtime.catalog_snapshot.captured_at`, `evidence_ref`, and the canonical `available_pairs_sha256`, and retain that evidence through final audit. The validator rejects a digest that no longer matches the normalized catalog contents. A later live-catalog change does not erase a previously accepted receipt; do not overwrite historical availability. Stop any still-planned spawn and start a newly validated ledger if execution must resume under a different catalog snapshot.
+
+Once Luna-Max-only execution starts, routing eligibility is also time-ordered. Append one global contiguous `event_seq` to each spawn attempt and recorded child result. The earliest non-`success` result or terminal `dispatch_blocked` attempt creates the only failure fence; ranking, a fresh work-unit ID, a same-wave label, or cosmetic contract edits cannot reopen the child pool. Only that earliest failed initial node's one valid direct retry may cross the fence, and only when the parent attested `failure_classification: transient` with evidence and the retry spawn follows the failed result event. A later failure from an already-dispatched sibling does not create another exception.
+
 Examples:
 
 - Luna `xhigh` unavailable for a structured node: a pre-enumerated Terra `high` pair may qualify.
@@ -175,7 +216,7 @@ For every substitution report requested pair, actual pair, selection origin, rea
 | --- | --- |
 | `balanced` | Reliable first-pass result with reasonable critical-path latency and expected total cost |
 | `latency` | Lowest observed critical-path time among qualified candidates |
-| `economy` | Lowest expected total cost including retry, review, rework, and escalation |
+| `economy` | Lowest expected total cost including retry, review, rework, escalation, and coordination, subject to a lower-than-parent delegation gate |
 | `quality` | Highest conservative quality band plus stronger independent evidence |
 
 Record all applicable evidence metadata:
@@ -193,6 +234,69 @@ Source meanings:
 
 With `none`, do not claim quantitative optimization. With `community_prior`, make only a qualitative tie-break and disclose the evidence limitation.
 
+### Economy evaluation contract
+
+Every Economy node selected by `automatic` or `fallback` records an `economy_evaluation`. The evaluated candidate universe is the complete `allowed_model_effort_pairs` set for automatic selection and the complete `fallback_pairs` set for fallback selection. Candidate omission is invalid. `explicit_user` and `inherited` selections bypass Economy ranking; omit the evaluation and report the bypass.
+
+Shared fields:
+
+```json
+{
+  "mode": "qualitative | quantitative",
+  "formula_version": null,
+  "cost_unit": null,
+  "cohort_id": null,
+  "parent_estimate": null,
+  "candidate_estimates": [],
+  "qualitative_order": [],
+  "tie_break": "declared_order | pair_key_lexicographic",
+  "delegation_decision": "delegate",
+  "rationale": "visible decision basis"
+}
+```
+
+`nodes` contain only proposed or actual children, so an Economy node must declare `delegation_decision: delegate`. If the decision is `keep_parent`, omit the child node and execute it in the parent. Parent-local work is outside the ledger's node array.
+
+Qualitative mode is valid only when comparable numeric evidence is unavailable and `metric_source` is `none` or `community_prior`. Set `formula_version`, `cost_unit`, `cohort_id`, and `parent_estimate` to null; leave `candidate_estimates` empty; use `tie_break: declared_order`; and put every candidate exactly once in `qualitative_order`, with the selected pair first. This makes the decision reproducible as a declared ordering but does not prove a cost optimum. A root declaration of `runtime` or `local_telemetry` requires quantitative mode rather than allowing a convenient downgrade.
+
+Quantitative mode requires `metric_source: runtime | local_telemetry`, one visible shared cost unit, one comparable cohort covering the same task shape/tool surface/context/validation burden, and formula version `expected-total-cost-v1`. Every candidate and the parent baseline use the same cost-vector schema. Each candidate estimate is:
+
+```json
+{
+  "pair": {"model": "gpt-5.6-luna", "family": "luna", "effort": "xhigh"},
+  "sample_size": 12,
+  "evidence_ref": "telemetry-window#candidate:gpt-5.6-luna:xhigh",
+  "initial_cost": 1.0,
+  "retry_probability": 0.1,
+  "retry_cost_if_triggered": 1.0,
+  "rework_probability": 0.05,
+  "rework_cost_if_triggered": 1.5,
+  "review_cost": 0.1,
+  "escalation_probability": 0.02,
+  "escalation_cost_if_triggered": 2.0,
+  "coordination_cost": 0.1,
+  "expected_total_cost": 1.415
+}
+```
+
+`parent_estimate` has the same fields, including `pair`. Its pair must exactly equal `orchestration.parent`, and its evidence reference uses a distinct parent record such as `telemetry-window#parent:gpt-5.6-sol:xhigh`. Every candidate/parent reference must be unique and begin with the root `evidence_id_or_window` followed by `#<record-id>`; this prevents cross-window or unbound scalar baselines from being presented as the current comparison.
+
+The validator recomputes:
+
+```text
+expected-total-cost-v1 =
+    initial_cost
+  + retry_probability      * retry_cost_if_triggered
+  + rework_probability     * rework_cost_if_triggered
+  + review_cost
+  + escalation_probability * escalation_cost_if_triggered
+  + coordination_cost
+```
+
+All costs must be finite, non-negative, and no greater than `10^15`; probabilities are in `[0,1]`; sample size is positive. Numeric inputs use at most six decimal places. The validator converts them to decimal fixed-point, computes the formula, and rounds the total to six places using half-even rounding; it does not use a scale-dependent floating-point relative tolerance. `qualitative_order` is empty in quantitative mode. Select the lowest recomputed total; exact six-decimal ties use lexicographic order over normalized `(model, family, effort)`. The selected total must also be strictly below the recomputed same-cohort `parent_estimate` total; otherwise the node stays in the parent. Root `metric_as_of`/`evidence_id_or_window`, unique namespaced candidate/parent `evidence_ref` values, `cohort_id`, and `cost_unit` form the auditable evidence binding. They prove internal arithmetic and provenance consistency, but without access to the referenced telemetry the ledger still cannot self-prove that external measurements are truthful.
+
+In `luna_max_only`, the pair ranking has one member. Economy still records whether the Luna Max child has positive value against the parent baseline and can influence which qualified node should occupy scarce concurrency, but it cannot change the exact child pair. Do not claim that the modifier guarantees a particular quota, billed cost, or wall-clock saving unless the runtime exposes comparable evidence.
+
 ## Labels and observability
 
 Treat observability as part of routing correctness:
@@ -207,6 +311,8 @@ selection.selected_pair
 ```
 
 For explicit dispatch, set both `model` and `reasoning_effort`. If only the model is supplied, the runtime may apply that model's configured/default effort; record `default-unresolved` and fail closed. An accepted exact pair is `confirmed-explicit`, or `fallback-confirmed` when it is the declared fallback.
+
+`luna_max_only` permits only explicit dispatch with both `model: gpt-5.6-luna` and `reasoning_effort: max`. It forbids inheritance even from a Luna Max parent, because the mode requires a directly auditable child override and must not depend on parent state.
 
 For inheritance, first establish the exact current parent model and effort from available live context. Omit both overrides and use the full-history fork only when the current collaboration contract guarantees inheritance. The accepted result is `confirmed-inherited`. If either the parent pair or inheritance guarantee is unknown, record `inherited-unresolved` for audit and do not spawn.
 

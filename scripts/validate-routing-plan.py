@@ -9,7 +9,9 @@ model capability, sandbox enforcement, or task correctness.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import posixpath
 import re
 import sys
@@ -17,6 +19,7 @@ import unicodedata
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -25,6 +28,15 @@ SCHEMA_VERSION = "aar.routing-ledger.v2"
 LEDGER_PHASES = {"planning", "active", "finalized"}
 NODE_LIFECYCLE_STATES = {"planned", "dispatched", "completed", "dispatch_blocked"}
 PROFILES = {"balanced", "latency", "economy", "quality"}
+CHILD_POLICIES = {"adaptive", "luna_max_only"}
+ECONOMY_EVALUATION_MODES = {"qualitative", "quantitative"}
+ECONOMY_DELEGATION_DECISIONS = {"delegate", "keep_parent"}
+ECONOMY_TIE_BREAKS = {"declared_order", "pair_key_lexicographic"}
+ECONOMY_FORMULA_VERSION = "expected-total-cost-v1"
+ECONOMY_DECIMAL_PLACES = 6
+ECONOMY_QUANTUM = Decimal("0.000001")
+ECONOMY_MAX_COST = 1_000_000_000_000_000.0
+RETRY_KINDS = {"none", "transient", "substantive"}
 METRIC_SOURCES = {"runtime", "local_telemetry", "community_prior", "none"}
 ORCHESTRATION_STATES = {"manual_allowed", "ultra_owned", "unknown"}
 FAMILIES = {"sol", "terra", "luna", "other", "unknown"}
@@ -64,6 +76,21 @@ CONFIRMATION_STATUSES = {
     "fallback-confirmed",
 }
 RESULT_STATUSES = {"success", "partial", "blocked", "failed", "escalate"}
+FAILURE_CLASSIFICATIONS = {
+    "none",
+    "transient",
+    "missing_context",
+    "bad_decomposition",
+    "weak_oracle",
+    "reasoning_failure",
+    "scope_became_open",
+    "permission_or_decision",
+    "interrupted_partial_write",
+    "runtime_unavailable",
+    "runtime_receipt_mismatch",
+    "model_effort_unresolved",
+    "validation_failure",
+}
 FALLBACK_REASONS = {
     "unavailable",
     "policy_rejection",
@@ -100,6 +127,7 @@ WRITE_POST_VALIDATION_KINDS = {
     "external_state",
 }
 CANONICAL_MODEL_ALIASES = {"gpt-5.6": "sol"}
+LUNA_MAX_PAIR_KEY = ("gpt-5.6-luna", "luna", "max")
 
 
 class DuplicateJSONKeyError(ValueError):
@@ -151,6 +179,35 @@ def _sort_issues(issues: Iterable[Issue]) -> list[Issue]:
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        # Python integers are always finite. Passing an arbitrarily large int
+        # through math.isfinite first coerces it to float and may overflow.
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _decimal_places(value: int | float) -> int:
+    exponent = Decimal(str(value)).as_tuple().exponent
+    return max(0, -exponent)
+
+
+def _economy_expected_total(value: dict[str, Any]) -> Decimal:
+    decimal_value = lambda field: Decimal(str(value[field]))
+    total = (
+        decimal_value("initial_cost")
+        + decimal_value("retry_probability") * decimal_value("retry_cost_if_triggered")
+        + decimal_value("rework_probability") * decimal_value("rework_cost_if_triggered")
+        + decimal_value("review_cost")
+        + decimal_value("escalation_probability")
+        * decimal_value("escalation_cost_if_triggered")
+        + decimal_value("coordination_cost")
+    )
+    return total.quantize(ECONOMY_QUANTUM, rounding=ROUND_HALF_EVEN)
 
 
 def _pair_key(pair: Any) -> tuple[str, str, str] | None:
@@ -275,6 +332,33 @@ def _has_visible_base(value: str) -> bool:
     )
 
 
+def _runtime_catalog_sha256(available_pairs: list[dict[str, Any]]) -> str:
+    normalized = [
+        {
+            "model": pair["model"],
+            "family": pair["family"],
+            "effort": pair["effort"],
+            "eligible_work_classes": sorted(pair["eligible_work_classes"]),
+        }
+        for pair in available_pairs
+    ]
+    normalized.sort(
+        key=lambda pair: (
+            pair["model"],
+            pair["family"],
+            pair["effort"],
+            pair["eligible_work_classes"],
+        )
+    )
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _valid_metric_as_of(value: str) -> bool:
     if value != value.strip() or _contains_invisible_or_control(value):
         return False
@@ -343,6 +427,26 @@ class StructureValidator:
             suffix = f" and at most {maximum}" if maximum is not None else ""
             self.error("SCHEMA_VALUE", path, f"Expected at least {minimum}{suffix}.")
 
+    def number(
+        self,
+        value: Any,
+        path: str,
+        minimum: float = 0.0,
+        maximum: float | None = None,
+        max_decimal_places: int | None = None,
+    ) -> None:
+        if not _is_finite_number(value):
+            self.error("SCHEMA_TYPE", path, "Expected a finite number.")
+        elif value < minimum or (maximum is not None and value > maximum):
+            suffix = f" and at most {maximum}" if maximum is not None else ""
+            self.error("SCHEMA_VALUE", path, f"Expected at least {minimum}{suffix}.")
+        elif max_decimal_places is not None and _decimal_places(value) > max_decimal_places:
+            self.error(
+                "SCHEMA_VALUE",
+                path,
+                f"Expected at most {max_decimal_places} decimal places.",
+            )
+
     def string_list(self, value: Any, path: str, min_items: int = 0) -> None:
         if not isinstance(value, list):
             self.error("SCHEMA_TYPE", path, "Expected an array.")
@@ -387,6 +491,185 @@ class StructureValidator:
                         f"Unknown work class '{value_item}'.",
                     )
 
+    def economy_candidate_estimate(self, value: Any, path: str) -> None:
+        estimate = self.object(
+            value,
+            path,
+            {
+                "pair",
+                "sample_size",
+                "evidence_ref",
+                "initial_cost",
+                "retry_probability",
+                "retry_cost_if_triggered",
+                "rework_probability",
+                "rework_cost_if_triggered",
+                "review_cost",
+                "escalation_probability",
+                "escalation_cost_if_triggered",
+                "coordination_cost",
+                "expected_total_cost",
+            },
+        )
+        if estimate is None:
+            return
+        self.pair(estimate.get("pair"), f"{path}/pair")
+        self.integer(estimate.get("sample_size"), f"{path}/sample_size", 1)
+        self.string(estimate.get("evidence_ref"), f"{path}/evidence_ref")
+        for field_name in (
+            "initial_cost",
+            "retry_cost_if_triggered",
+            "rework_cost_if_triggered",
+            "review_cost",
+            "escalation_cost_if_triggered",
+            "coordination_cost",
+            "expected_total_cost",
+        ):
+            self.number(
+                estimate.get(field_name),
+                f"{path}/{field_name}",
+                maximum=ECONOMY_MAX_COST,
+                max_decimal_places=ECONOMY_DECIMAL_PLACES,
+            )
+        for field_name in (
+            "retry_probability",
+            "rework_probability",
+            "escalation_probability",
+        ):
+            self.number(
+                estimate.get(field_name),
+                f"{path}/{field_name}",
+                0.0,
+                1.0,
+                ECONOMY_DECIMAL_PLACES,
+            )
+
+    def economy_parent_estimate(self, value: Any, path: str) -> None:
+        estimate = self.object(
+            value,
+            path,
+            {
+                "pair",
+                "sample_size",
+                "evidence_ref",
+                "initial_cost",
+                "retry_probability",
+                "retry_cost_if_triggered",
+                "rework_probability",
+                "rework_cost_if_triggered",
+                "review_cost",
+                "escalation_probability",
+                "escalation_cost_if_triggered",
+                "coordination_cost",
+                "expected_total_cost",
+            },
+        )
+        if estimate is None:
+            return
+        self.pair(estimate.get("pair"), f"{path}/pair")
+        self.integer(estimate.get("sample_size"), f"{path}/sample_size", 1)
+        self.string(estimate.get("evidence_ref"), f"{path}/evidence_ref")
+        for field_name in (
+            "initial_cost",
+            "retry_cost_if_triggered",
+            "rework_cost_if_triggered",
+            "review_cost",
+            "escalation_cost_if_triggered",
+            "coordination_cost",
+            "expected_total_cost",
+        ):
+            self.number(
+                estimate.get(field_name),
+                f"{path}/{field_name}",
+                maximum=ECONOMY_MAX_COST,
+                max_decimal_places=ECONOMY_DECIMAL_PLACES,
+            )
+        for field_name in (
+            "retry_probability",
+            "rework_probability",
+            "escalation_probability",
+        ):
+            self.number(
+                estimate.get(field_name),
+                f"{path}/{field_name}",
+                0.0,
+                1.0,
+                ECONOMY_DECIMAL_PLACES,
+            )
+
+    def economy_evaluation(self, value: Any, path: str) -> None:
+        evaluation = self.object(
+            value,
+            path,
+            {
+                "mode",
+                "formula_version",
+                "cost_unit",
+                "cohort_id",
+                "parent_estimate",
+                "candidate_estimates",
+                "qualitative_order",
+                "tie_break",
+                "delegation_decision",
+                "rationale",
+            },
+        )
+        if evaluation is None:
+            return
+        self.enum(evaluation.get("mode"), ECONOMY_EVALUATION_MODES, f"{path}/mode")
+        self.enum(evaluation.get("tie_break"), ECONOMY_TIE_BREAKS, f"{path}/tie_break")
+        self.enum(
+            evaluation.get("delegation_decision"),
+            ECONOMY_DELEGATION_DECISIONS,
+            f"{path}/delegation_decision",
+        )
+        self.string(evaluation.get("rationale"), f"{path}/rationale")
+        for field_name in ("formula_version", "cost_unit", "cohort_id"):
+            if evaluation.get(field_name) is not None:
+                self.string(evaluation.get(field_name), f"{path}/{field_name}")
+        if evaluation.get("parent_estimate") is not None:
+            self.economy_parent_estimate(
+                evaluation.get("parent_estimate"),
+                f"{path}/parent_estimate",
+            )
+
+        estimates = evaluation.get("candidate_estimates")
+        if not isinstance(estimates, list):
+            self.error("SCHEMA_TYPE", f"{path}/candidate_estimates", "Expected an array.")
+        else:
+            seen_estimates: set[tuple[str, str, str]] = set()
+            for index, estimate in enumerate(estimates):
+                estimate_path = f"{path}/candidate_estimates/{index}"
+                self.economy_candidate_estimate(estimate, estimate_path)
+                if isinstance(estimate, dict):
+                    key = _pair_key(estimate.get("pair"))
+                    if key is not None:
+                        if key in seen_estimates:
+                            self.error(
+                                "SCHEMA_DUPLICATE_ITEM",
+                                f"{estimate_path}/pair",
+                                f"Duplicate economy candidate {key}.",
+                            )
+                        seen_estimates.add(key)
+
+        order = evaluation.get("qualitative_order")
+        if not isinstance(order, list):
+            self.error("SCHEMA_TYPE", f"{path}/qualitative_order", "Expected an array.")
+        else:
+            seen_order: set[tuple[str, str, str]] = set()
+            for index, candidate in enumerate(order):
+                candidate_path = f"{path}/qualitative_order/{index}"
+                self.pair(candidate, candidate_path)
+                key = _pair_key(candidate)
+                if key is not None:
+                    if key in seen_order:
+                        self.error(
+                            "SCHEMA_DUPLICATE_ITEM",
+                            candidate_path,
+                            f"Duplicate qualitative economy candidate {key}.",
+                        )
+                    seen_order.add(key)
+
     def validation_step(self, value: Any, path: str) -> None:
         step = self.object(value, path, {"id", "kind", "phase", "required"}, {"target"})
         if step is None:
@@ -417,10 +700,13 @@ class StructureValidator:
                 "effective_pair",
                 "confirmation_status",
             },
+            {"event_seq"},
         )
         if attempt is None:
             return
         self.integer(attempt.get("attempt_index"), f"{path}/attempt_index", 1)
+        if "event_seq" in attempt:
+            self.integer(attempt.get("event_seq"), f"{path}/event_seq", 1)
         self.enum(attempt.get("mode"), DISPATCH_MODES, f"{path}/mode")
         self.string(attempt.get("task_name"), f"{path}/task_name")
         task_name = attempt.get("task_name")
@@ -486,11 +772,38 @@ class StructureValidator:
                 "assigned_pair_echo",
                 "confirmation_status_echo",
             },
+            {"event_seq", "failure_classification", "failure_evidence"},
         )
         if result is None:
             return
         self.enum(result.get("status"), RESULT_STATUSES, f"{path}/status")
         self.integer(result.get("dispatch_attempt"), f"{path}/dispatch_attempt", 1)
+        if "event_seq" in result:
+            self.integer(result.get("event_seq"), f"{path}/event_seq", 1)
+        if "failure_classification" in result:
+            self.enum(
+                result.get("failure_classification"),
+                FAILURE_CLASSIFICATIONS,
+                f"{path}/failure_classification",
+            )
+        if "failure_evidence" in result:
+            failure_evidence = result.get("failure_evidence")
+            self.string_list(failure_evidence, f"{path}/failure_evidence")
+            if isinstance(failure_evidence, list):
+                for index, evidence_item in enumerate(failure_evidence):
+                    if isinstance(evidence_item, str) and (
+                        evidence_item != evidence_item.strip()
+                        or _contains_invisible_or_control(evidence_item)
+                        or not any(character.isalnum() for character in evidence_item)
+                    ):
+                        self.error(
+                            "SCHEMA_PATTERN",
+                            f"{path}/failure_evidence/{index}",
+                            (
+                                "Failure evidence must contain a visible letter or number and no "
+                                "surrounding whitespace or invisible/control characters."
+                            ),
+                        )
         self.string(result.get("agent_label"), f"{path}/agent_label")
         self.pair(result.get("assigned_pair_echo"), f"{path}/assigned_pair_echo")
         self.enum(
@@ -533,7 +846,14 @@ class StructureValidator:
             "dispatch",
             "result",
         }
-        optional = {"read_only_control", "review_of"}
+        optional = {
+            "economy_evaluation",
+            "read_only_control",
+            "review_of",
+            "work_unit_id",
+            "retry_of",
+            "retry_kind",
+        }
         node = self.object(value, path, required, optional)
         if node is None:
             return
@@ -550,6 +870,28 @@ class StructureValidator:
                 "Executor ID must match ^[a-z][a-z0-9_]{0,63}$.",
                 node_id,
             )
+        if "work_unit_id" in node:
+            self.string(node.get("work_unit_id"), f"{path}/work_unit_id")
+            work_unit_id = node.get("work_unit_id")
+            if isinstance(work_unit_id, str) and not NODE_ID_RE.fullmatch(work_unit_id):
+                self.error(
+                    "SCHEMA_PATTERN",
+                    f"{path}/work_unit_id",
+                    "Work-unit ID must match ^[a-z][a-z0-9_]{0,63}$.",
+                    node_id,
+                )
+        if "retry_of" in node and node.get("retry_of") is not None:
+            self.string(node.get("retry_of"), f"{path}/retry_of")
+            retry_of = node.get("retry_of")
+            if isinstance(retry_of, str) and not NODE_ID_RE.fullmatch(retry_of):
+                self.error(
+                    "SCHEMA_PATTERN",
+                    f"{path}/retry_of",
+                    "retry_of must be null or a canonical node ID.",
+                    node_id,
+                )
+        if "retry_kind" in node:
+            self.enum(node.get("retry_kind"), RETRY_KINDS, f"{path}/retry_kind")
         self.integer(node.get("wave"), f"{path}/wave")
         self.enum(node.get("role"), ROLES, f"{path}/role")
         self.string(node.get("objective"), f"{path}/objective")
@@ -681,6 +1023,11 @@ class StructureValidator:
         result = node.get("result")
         if result is not None:
             self.result_attestation(result, f"{path}/result")
+        if "economy_evaluation" in node:
+            self.economy_evaluation(
+                node.get("economy_evaluation"),
+                f"{path}/economy_evaluation",
+            )
         if "read_only_control" in node:
             control = self.object(
                 node["read_only_control"],
@@ -711,6 +1058,7 @@ class StructureValidator:
                 "runtime",
                 "nodes",
             },
+            {"child_policy"},
         )
         if root is None:
             return _sort_issues(self.errors)
@@ -722,6 +1070,8 @@ class StructureValidator:
             )
         self.enum(root.get("ledger_phase"), LEDGER_PHASES, "/ledger_phase")
         self.enum(root.get("profile"), PROFILES, "/profile")
+        if "child_policy" in root:
+            self.enum(root.get("child_policy"), CHILD_POLICIES, "/child_policy")
         self.enum(root.get("metric_source"), METRIC_SOURCES, "/metric_source")
         for field_name in ("metric_as_of", "evidence_id_or_window"):
             value = root.get(field_name)
@@ -746,7 +1096,12 @@ class StructureValidator:
                     "/orchestration/parent/integrator_class",
                 )
 
-        runtime = self.object(root.get("runtime"), "/runtime", {"max_concurrent_children", "available_pairs"})
+        runtime = self.object(
+            root.get("runtime"),
+            "/runtime",
+            {"max_concurrent_children", "available_pairs"},
+            {"catalog_snapshot"},
+        )
         if runtime is not None:
             limit = runtime.get("max_concurrent_children")
             if limit is not None:
@@ -767,6 +1122,45 @@ class StructureValidator:
                                 f"Duplicate runtime pair {key}.",
                             )
                         seen_pairs.add(key)
+            if "catalog_snapshot" in runtime:
+                snapshot = self.object(
+                    runtime.get("catalog_snapshot"),
+                    "/runtime/catalog_snapshot",
+                    {"captured_at", "evidence_ref", "available_pairs_sha256"},
+                )
+                if snapshot is not None:
+                    captured_at = snapshot.get("captured_at")
+                    self.string(captured_at, "/runtime/catalog_snapshot/captured_at")
+                    if isinstance(captured_at, str) and not _valid_metric_as_of(captured_at):
+                        self.error(
+                            "SCHEMA_FORMAT",
+                            "/runtime/catalog_snapshot/captured_at",
+                            "captured_at must be an ISO 8601 date or timezone-aware timestamp.",
+                        )
+                    evidence_ref = snapshot.get("evidence_ref")
+                    self.string(evidence_ref, "/runtime/catalog_snapshot/evidence_ref")
+                    if isinstance(evidence_ref, str) and (
+                        evidence_ref != evidence_ref.strip()
+                        or _contains_invisible_or_control(evidence_ref)
+                    ):
+                        self.error(
+                            "SCHEMA_PATTERN",
+                            "/runtime/catalog_snapshot/evidence_ref",
+                            "evidence_ref may not contain surrounding whitespace or invisible/control characters.",
+                        )
+                    available_pairs_sha256 = snapshot.get("available_pairs_sha256")
+                    self.string(
+                        available_pairs_sha256,
+                        "/runtime/catalog_snapshot/available_pairs_sha256",
+                    )
+                    if isinstance(available_pairs_sha256, str) and not re.fullmatch(
+                        r"[0-9a-f]{64}", available_pairs_sha256
+                    ):
+                        self.error(
+                            "SCHEMA_PATTERN",
+                            "/runtime/catalog_snapshot/available_pairs_sha256",
+                            "available_pairs_sha256 must be a lowercase SHA-256 hex digest.",
+                        )
 
         nodes = root.get("nodes")
         if not isinstance(nodes, list):
@@ -812,6 +1206,778 @@ class SemanticValidator:
 
     def _runtime_pairs(self) -> dict[tuple[str, str, str], dict[str, Any]]:
         return {_pair_key(pair): pair for pair in self.plan["runtime"]["available_pairs"]}  # type: ignore[misc]
+
+    def _validate_child_policy(self) -> None:
+        """Enforce hard candidate-pool constraints independently of ranking profiles."""
+        if self.plan.get("child_policy", "adaptive") != "luna_max_only":
+            return
+
+        runtime_pairs = self._runtime_pairs()
+        has_dispatch_events = any(node["dispatch"] is not None for node in self.nodes_by_id.values())
+        if has_dispatch_events and "catalog_snapshot" not in self.plan["runtime"]:
+            self.error(
+                "CHILD_POLICY_RUNTIME_SNAPSHOT_REQUIRED",
+                "/runtime/catalog_snapshot",
+                (
+                    "Luna-Max-only execution requires an immutable dispatch-time runtime catalog "
+                    "snapshot with captured_at and evidence_ref."
+                ),
+            )
+        snapshot = self.plan["runtime"].get("catalog_snapshot")
+        if snapshot is not None:
+            expected_digest = _runtime_catalog_sha256(self.plan["runtime"]["available_pairs"])
+            if snapshot["available_pairs_sha256"] != expected_digest:
+                self.error(
+                    "CHILD_POLICY_RUNTIME_SNAPSHOT_DIGEST_MISMATCH",
+                    "/runtime/catalog_snapshot/available_pairs_sha256",
+                    (
+                        "The Luna-Max-only catalog snapshot digest does not match the canonical "
+                        "runtime.available_pairs contents."
+                    ),
+                )
+        if LUNA_MAX_PAIR_KEY not in runtime_pairs:
+            for node_id, node in self.nodes_by_id.items():
+                if node["lifecycle_state"] in {"dispatched", "completed"}:
+                    self.error(
+                        "CHILD_POLICY_LUNA_MAX_UNAVAILABLE",
+                        self._node_path(node_id, "lifecycle_state"),
+                        (
+                            "A dispatched or completed Luna-Max-only child requires the exact "
+                            "gpt-5.6-luna / max pair in the runtime catalog. Keep an unavailable "
+                            "target planned or record only a rejected dispatch_blocked attempt."
+                        ),
+                        node_id,
+                    )
+
+        def require_luna_max(pair: Any, path: str, node_id: str) -> None:
+            if pair is not None and _pair_key(pair) != LUNA_MAX_PAIR_KEY:
+                self.error(
+                    "CHILD_POLICY_PAIR_FORBIDDEN",
+                    path,
+                    (
+                        "child_policy='luna_max_only' permits only the exact pair "
+                        "('gpt-5.6-luna', 'luna', 'max') in every child routing field."
+                    ),
+                    node_id,
+                )
+
+        for node_id, node in self.nodes_by_id.items():
+            path = self._node_path(node_id)
+            requirements = node["requirements"]
+            selection = node["selection"]
+            allowed_pairs = requirements["allowed_model_effort_pairs"]
+            fallback_pairs = requirements["fallback_pairs"]
+
+            retry_metadata = {"work_unit_id", "retry_of", "retry_kind"}
+            missing_retry_metadata = sorted(retry_metadata - node.keys())
+            if missing_retry_metadata:
+                self.error(
+                    "CHILD_POLICY_RETRY_METADATA_REQUIRED",
+                    path,
+                    (
+                        "Luna-Max-only nodes require explicit work_unit_id, retry_of, and "
+                        f"retry_kind fields; missing {missing_retry_metadata}."
+                    ),
+                    node_id,
+                )
+
+            eligible_shape = (
+                node["work_class"] == "structured"
+                and node["context_scope"] == "bounded"
+                and node["oracle"] in {"deterministic", "strong"}
+                and node["risk"] not in {"high", "irreversible"}
+                and node["access_mode"] != "external_write"
+                and node["role"] not in {"architect", "diagnostician", "reviewer"}
+            )
+            if not eligible_shape:
+                self.error(
+                    "CHILD_POLICY_NODE_MUST_STAY_PARENT",
+                    path,
+                    (
+                        "Luna-Max-only children must be structured, bounded, strongly verifiable, "
+                        "non-high-risk, non-external-write leaves and may not be architects, "
+                        "diagnosticians, or reviewers. Keep this node in the parent or rerun "
+                        "without children=luna-max."
+                    ),
+                    node_id,
+                )
+
+            if len(allowed_pairs) != 1 or _pair_key(allowed_pairs[0]) != LUNA_MAX_PAIR_KEY:
+                self.error(
+                    "CHILD_POLICY_ALLOWED_SET_INVALID",
+                    f"{path}/requirements/allowed_model_effort_pairs",
+                    "Luna-Max-only mode requires the singleton allowed set [gpt-5.6-luna / max].",
+                    node_id,
+                )
+            for pair_index, candidate in enumerate(allowed_pairs):
+                require_luna_max(
+                    candidate,
+                    f"{path}/requirements/allowed_model_effort_pairs/{pair_index}",
+                    node_id,
+                )
+
+            if fallback_pairs:
+                self.error(
+                    "CHILD_POLICY_FALLBACK_FORBIDDEN",
+                    f"{path}/requirements/fallback_pairs",
+                    (
+                        "Luna-Max-only mode has no child fallback pair. Runtime unavailability or "
+                        "a substantive failure returns the node to the parent."
+                    ),
+                    node_id,
+                )
+            for pair_index, candidate in enumerate(fallback_pairs):
+                require_luna_max(
+                    candidate,
+                    f"{path}/requirements/fallback_pairs/{pair_index}",
+                    node_id,
+                )
+
+            if requirements["minimum_child_effort"] != "max":
+                self.error(
+                    "CHILD_POLICY_MINIMUM_EFFORT_INVALID",
+                    f"{path}/requirements/minimum_child_effort",
+                    "Luna-Max-only mode requires minimum_child_effort='max'.",
+                    node_id,
+                )
+            if node["attempt_budget"]["substantive_attempts"] != 1:
+                self.error(
+                    "CHILD_POLICY_SUBSTANTIVE_RETRY_FORBIDDEN",
+                    f"{path}/attempt_budget/substantive_attempts",
+                    (
+                        "Luna-Max-only mode permits no Luna-to-Luna substantive repair loop; "
+                        "set substantive_attempts to 1."
+                    ),
+                    node_id,
+                )
+            if node["attempt_budget"]["max_uses"] != 1:
+                self.error(
+                    "CHILD_POLICY_MAX_BUDGET_INVALID",
+                    f"{path}/attempt_budget/max_uses",
+                    "Luna-Max-only child nodes require max_uses=1.",
+                    node_id,
+                )
+
+            if selection["origin"] in {"fallback", "inherited"}:
+                self.error(
+                    "CHILD_POLICY_SELECTION_ORIGIN_FORBIDDEN",
+                    f"{path}/selection/origin",
+                    "Luna-Max-only mode forbids fallback and inherited child selection.",
+                    node_id,
+                )
+            require_luna_max(
+                selection["requested_pair"],
+                f"{path}/selection/requested_pair",
+                node_id,
+            )
+            require_luna_max(
+                selection["selected_pair"],
+                f"{path}/selection/selected_pair",
+                node_id,
+            )
+
+            dispatch = node["dispatch"]
+            if dispatch is not None:
+                allowed_attempts = 1 + node["attempt_budget"]["transient_retries"]
+                if len(dispatch["attempts"]) > allowed_attempts:
+                    self.error(
+                        "CHILD_POLICY_ATTEMPT_BUDGET_EXCEEDED",
+                        f"{path}/dispatch/attempts",
+                        (
+                            "Luna-Max-only dispatch history exceeds the declared transient retry "
+                            f"budget; at most {allowed_attempts} attempt(s) are allowed."
+                        ),
+                        node_id,
+                    )
+                for attempt_index, attempt in enumerate(dispatch["attempts"]):
+                    attempt_path = f"{path}/dispatch/attempts/{attempt_index}"
+                    if "event_seq" not in attempt:
+                        self.error(
+                            "CHILD_POLICY_EVENT_SEQUENCE_REQUIRED",
+                            f"{attempt_path}/event_seq",
+                            (
+                                "Every Luna-Max-only dispatch attempt requires a global event_seq "
+                                "so fail-stop ordering is mechanically auditable."
+                            ),
+                            node_id,
+                        )
+                    if attempt["mode"] != "explicit":
+                        self.error(
+                            "CHILD_POLICY_EXPLICIT_DISPATCH_REQUIRED",
+                            f"{attempt_path}/mode",
+                            "Luna-Max-only mode forbids inheritance and requires explicit dispatch.",
+                            node_id,
+                        )
+                    require_luna_max(
+                        attempt["requested_pair"],
+                        f"{attempt_path}/requested_pair",
+                        node_id,
+                    )
+                    if (
+                        attempt["model"] != LUNA_MAX_PAIR_KEY[0]
+                        or attempt["reasoning_effort"] != LUNA_MAX_PAIR_KEY[2]
+                    ):
+                        self.error(
+                            "CHILD_POLICY_EXPLICIT_ARGUMENTS_REQUIRED",
+                            attempt_path,
+                            (
+                                "Every Luna-Max-only spawn attempt must explicitly pass "
+                                "model='gpt-5.6-luna' and reasoning_effort='max'."
+                            ),
+                            node_id,
+                        )
+                    require_luna_max(
+                        attempt["effective_pair"],
+                        f"{attempt_path}/effective_pair",
+                        node_id,
+                    )
+
+            result = node["result"]
+            if result is not None:
+                if "event_seq" not in result:
+                    self.error(
+                        "CHILD_POLICY_EVENT_SEQUENCE_REQUIRED",
+                        f"{path}/result/event_seq",
+                        (
+                            "Every Luna-Max-only child result requires a global event_seq so "
+                            "dispatches that occur after failure can be rejected."
+                        ),
+                        node_id,
+                    )
+                missing_failure_fields = sorted(
+                    {"failure_classification", "failure_evidence"} - result.keys()
+                )
+                if missing_failure_fields:
+                    self.error(
+                        "CHILD_POLICY_FAILURE_ATTESTATION_REQUIRED",
+                        f"{path}/result",
+                        (
+                            "Luna-Max-only results require parent-verified failure_classification "
+                            f"and failure_evidence fields; missing {missing_failure_fields}."
+                        ),
+                        node_id,
+                    )
+                else:
+                    failure_classification = result["failure_classification"]
+                    failure_evidence = result["failure_evidence"]
+                    if result["status"] == "success":
+                        if failure_classification != "none":
+                            self.error(
+                                "CHILD_POLICY_FAILURE_CLASSIFICATION_INVALID",
+                                f"{path}/result/failure_classification",
+                                "A successful Luna-Max-only result requires failure_classification='none'.",
+                                node_id,
+                            )
+                        if failure_evidence:
+                            self.error(
+                                "CHILD_POLICY_FAILURE_EVIDENCE_INVALID",
+                                f"{path}/result/failure_evidence",
+                                "A successful Luna-Max-only result requires an empty failure_evidence list.",
+                                node_id,
+                            )
+                    else:
+                        if failure_classification == "none":
+                            self.error(
+                                "CHILD_POLICY_FAILURE_CLASSIFICATION_INVALID",
+                                f"{path}/result/failure_classification",
+                                "A non-success Luna-Max-only result requires a concrete failure classification.",
+                                node_id,
+                            )
+                        if not failure_evidence:
+                            self.error(
+                                "CHILD_POLICY_FAILURE_EVIDENCE_REQUIRED",
+                                f"{path}/result/failure_evidence",
+                                "A non-success Luna-Max-only result requires evidence for its failure classification.",
+                                node_id,
+                            )
+                require_luna_max(
+                    result["assigned_pair_echo"],
+                    f"{path}/result/assigned_pair_echo",
+                    node_id,
+                )
+
+        self._validate_luna_max_retry_graph()
+        self._validate_luna_max_event_sequence()
+        self._validate_luna_max_dependency_readiness()
+        self._validate_luna_max_fail_stop()
+
+    def _validate_luna_max_retry_graph(self) -> None:
+        """Validate declared work-unit identity and the single transient retry exception."""
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        metadata_fields = {"work_unit_id", "retry_of", "retry_kind"}
+
+        for node_id, node in self.nodes_by_id.items():
+            if not metadata_fields <= node.keys():
+                continue
+            path = self._node_path(node_id)
+            work_unit_id = node["work_unit_id"]
+            retry_kind = node["retry_kind"]
+            retry_of = node["retry_of"]
+            groups[work_unit_id].append(node)
+
+            if retry_kind == "none" and retry_of is not None:
+                self.error(
+                    "CHILD_POLICY_RETRY_RELATION_INVALID",
+                    f"{path}/retry_of",
+                    "retry_kind='none' requires retry_of=null.",
+                    node_id,
+                )
+            elif retry_kind == "transient" and retry_of is None:
+                self.error(
+                    "CHILD_POLICY_RETRY_RELATION_INVALID",
+                    f"{path}/retry_of",
+                    "retry_kind='transient' requires the prior node ID in retry_of.",
+                    node_id,
+                )
+            elif retry_kind == "substantive":
+                self.error(
+                    "CHILD_POLICY_SUBSTANTIVE_RETRY_FORBIDDEN",
+                    f"{path}/retry_kind",
+                    "Luna-Max-only mode forbids substantive cross-node rework.",
+                    node_id,
+                )
+
+        contract_fields = (
+            "role",
+            "objective",
+            "why_delegate",
+            "work_class",
+            "risk",
+            "context_scope",
+            "oracle",
+            "access_mode",
+            "known_facts",
+            "hypotheses",
+            "owned_mutable_surfaces",
+            "read_only_surfaces",
+            "write_conflict_groups",
+            "forbidden_actions",
+            "deliverables",
+            "acceptance_criteria",
+            "validation_steps",
+            "expected_evidence",
+            "recovery_steps",
+            "stop_conditions",
+            "escalate_when",
+            "requirements",
+            "selection",
+            "read_only_control",
+            "review_of",
+        )
+
+        signature_owner: dict[str, tuple[str, str]] = {}
+        for work_unit_id, nodes in groups.items():
+            for node in nodes:
+                signature = json.dumps(
+                    {field_name: node.get(field_name) for field_name in contract_fields},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                previous = signature_owner.get(signature)
+                if previous is None:
+                    signature_owner[signature] = (work_unit_id, node["id"])
+                elif previous[0] != work_unit_id:
+                    self.error(
+                        "CHILD_POLICY_WORK_UNIT_ID_CHANGED",
+                        self._node_path(node["id"], "work_unit_id"),
+                        (
+                            "Nodes with an identical Luna-Max-only contract must share one "
+                            "work_unit_id; changing only the work-unit identity cannot hide rework."
+                        ),
+                        node["id"],
+                        (previous[1],),
+                    )
+
+        for work_unit_id, nodes in groups.items():
+            initial_nodes = [node for node in nodes if node["retry_kind"] == "none"]
+            retry_nodes = [node for node in nodes if node["retry_kind"] == "transient"]
+            related_ids = tuple(node["id"] for node in nodes)
+
+            if len(initial_nodes) != 1:
+                self.error(
+                    "CHILD_POLICY_WORK_UNIT_INITIAL_INVALID",
+                    "/nodes",
+                    (
+                        f"Work unit '{work_unit_id}' requires exactly one retry_kind='none' "
+                        f"initial node; found {len(initial_nodes)}."
+                    ),
+                    related=related_ids,
+                )
+            if len(nodes) > 2 or len(retry_nodes) > 1:
+                self.error(
+                    "CHILD_POLICY_WORK_UNIT_RETRY_LIMIT",
+                    "/nodes",
+                    f"Work unit '{work_unit_id}' permits at most one transient retry node.",
+                    related=related_ids,
+                )
+            if len(initial_nodes) != 1:
+                continue
+
+            initial = initial_nodes[0]
+            initial_id = initial["id"]
+            initial_budget = initial["attempt_budget"]["transient_retries"]
+            initial_attempt_count = (
+                len(initial["dispatch"]["attempts"])
+                if initial["dispatch"] is not None
+                else 0
+            )
+            total_attempt_count = sum(
+                len(node["dispatch"]["attempts"])
+                if node["dispatch"] is not None
+                else 0
+                for node in nodes
+            )
+            allowed_work_unit_attempts = 1 + initial_budget
+            if total_attempt_count > allowed_work_unit_attempts:
+                self.error(
+                    "CHILD_POLICY_WORK_UNIT_ATTEMPT_BUDGET_EXCEEDED",
+                    "/nodes",
+                    (
+                        f"Work unit '{work_unit_id}' records {total_attempt_count} dispatch "
+                        f"attempts but permits at most {allowed_work_unit_attempts}."
+                    ),
+                    related=related_ids,
+                )
+
+            for retry in retry_nodes:
+                retry_id = retry["id"]
+                retry_path = self._node_path(retry_id)
+                prior_id = retry["retry_of"]
+                prior = self.nodes_by_id.get(prior_id)
+                if prior is None:
+                    self.error(
+                        "CHILD_POLICY_RETRY_TARGET_UNKNOWN",
+                        f"{retry_path}/retry_of",
+                        f"Retry target '{prior_id}' does not exist.",
+                        retry_id,
+                    )
+                    continue
+                if prior_id != initial_id or prior.get("work_unit_id") != work_unit_id:
+                    self.error(
+                        "CHILD_POLICY_RETRY_TARGET_MISMATCH",
+                        f"{retry_path}/retry_of",
+                        "A transient retry must point directly to its work unit's initial node.",
+                        retry_id,
+                        (prior_id,),
+                    )
+                if retry["executor_id"] != prior["executor_id"]:
+                    self.error(
+                        "CHILD_POLICY_RETRY_EXECUTOR_CHANGED",
+                        f"{retry_path}/executor_id",
+                        "An unchanged transient retry must keep the same executor_id.",
+                        retry_id,
+                        (prior_id,),
+                    )
+                expected_dependencies = set(prior["depends_on"]) | {prior_id}
+                if set(retry["depends_on"]) != expected_dependencies:
+                    self.error(
+                        "CHILD_POLICY_RETRY_DEPENDENCIES_CHANGED",
+                        f"{retry_path}/depends_on",
+                        (
+                            "A transient retry must depend on the initial node and preserve its "
+                            "original dependencies exactly."
+                        ),
+                        retry_id,
+                        (prior_id,),
+                    )
+                prior_result = prior["result"]
+                if (
+                    prior["lifecycle_state"] != "completed"
+                    or prior_result is None
+                    or prior_result["status"] != "failed"
+                ):
+                    self.error(
+                        "CHILD_POLICY_RETRY_PRIOR_NOT_FAILED",
+                        f"{retry_path}/retry_of",
+                        (
+                            "A cross-node transient retry requires a completed prior child whose "
+                            "result status is 'failed'. Runtime dispatch rejections retry inside "
+                            "the same node instead."
+                        ),
+                        retry_id,
+                        (prior_id,),
+                    )
+                elif prior_result.get("failure_classification") != "transient":
+                    self.error(
+                        "CHILD_POLICY_RETRY_PRIOR_NOT_TRANSIENT",
+                        f"{retry_path}/retry_of",
+                        (
+                            "A Luna-Max-only retry requires the parent to classify the failed "
+                            "initial result as transient with supporting failure evidence."
+                        ),
+                        retry_id,
+                        (prior_id,),
+                    )
+                changed_fields = [
+                    field_name
+                    for field_name in contract_fields
+                    if retry.get(field_name) != prior.get(field_name)
+                ]
+                if changed_fields:
+                    self.error(
+                        "CHILD_POLICY_RETRY_CONTRACT_CHANGED",
+                        retry_path,
+                        (
+                            "A transient retry must preserve the work contract; changed fields: "
+                            f"{changed_fields}."
+                        ),
+                        retry_id,
+                        (prior_id,),
+                    )
+                if initial_budget != 1 or retry["attempt_budget"]["transient_retries"] != 0:
+                    self.error(
+                        "CHILD_POLICY_RETRY_BUDGET_INVALID",
+                        f"{retry_path}/attempt_budget/transient_retries",
+                        (
+                            "The initial node must declare one transient retry and the retry node "
+                            "must declare zero remaining retries."
+                        ),
+                        retry_id,
+                        (prior_id,),
+                    )
+                if initial_attempt_count >= allowed_work_unit_attempts:
+                    self.error(
+                        "CHILD_POLICY_RETRY_BUDGET_EXHAUSTED",
+                        f"{retry_path}/retry_of",
+                        "The initial node already consumed the work unit's dispatch-attempt budget.",
+                        retry_id,
+                        (prior_id,),
+                    )
+                retry_dispatch = retry["dispatch"]
+                retry_attempt_sequences = (
+                    [
+                        attempt.get("event_seq")
+                        for attempt in retry_dispatch["attempts"]
+                        if _is_int(attempt.get("event_seq"))
+                    ]
+                    if retry_dispatch is not None
+                    else []
+                )
+                prior_result_sequence = (
+                    prior_result.get("event_seq") if prior_result is not None else None
+                )
+                if (
+                    retry_attempt_sequences
+                    and _is_int(prior_result_sequence)
+                    and min(retry_attempt_sequences) <= prior_result_sequence
+                ):
+                    self.error(
+                        "CHILD_POLICY_RETRY_EVENT_ORDER",
+                        f"{retry_path}/dispatch/attempts",
+                        (
+                            "Every transient-retry spawn event must occur after the failed "
+                            "initial result event recorded in retry_of."
+                        ),
+                        retry_id,
+                        (prior_id,),
+                    )
+
+    def _validate_luna_max_event_sequence(self) -> None:
+        """Validate the append-only global order used by Luna-Max-only fail-stop."""
+        events: list[tuple[int, str, str]] = []
+        for node_id, node in self.nodes_by_id.items():
+            dispatch = node["dispatch"]
+            attempt_sequences: list[int] = []
+            if dispatch is not None:
+                for attempt_index, attempt in enumerate(dispatch["attempts"]):
+                    event_seq = attempt.get("event_seq")
+                    if not _is_int(event_seq):
+                        continue
+                    path = self._node_path(
+                        node_id,
+                        f"dispatch/attempts/{attempt_index}/event_seq",
+                    )
+                    events.append((event_seq, node_id, path))
+                    attempt_sequences.append(event_seq)
+                if attempt_sequences != sorted(attempt_sequences):
+                    self.error(
+                        "CHILD_POLICY_EVENT_SEQUENCE_ORDER",
+                        self._node_path(node_id, "dispatch/attempts"),
+                        "Dispatch-attempt event_seq values must increase with attempt_index.",
+                        node_id,
+                    )
+
+            result = node["result"]
+            if result is not None and _is_int(result.get("event_seq")):
+                result_sequence = result["event_seq"]
+                result_path = self._node_path(node_id, "result/event_seq")
+                events.append((result_sequence, node_id, result_path))
+                if attempt_sequences and result_sequence <= max(attempt_sequences):
+                    self.error(
+                        "CHILD_POLICY_RESULT_EVENT_ORDER",
+                        result_path,
+                        "A child result event_seq must be later than every dispatch attempt for that node.",
+                        node_id,
+                    )
+
+        sequence_owners: dict[int, list[tuple[str, str]]] = defaultdict(list)
+        for event_seq, node_id, path in events:
+            sequence_owners[event_seq].append((node_id, path))
+        duplicate_sequences = {
+            event_seq: owners
+            for event_seq, owners in sequence_owners.items()
+            if len(owners) > 1
+        }
+        for event_seq, owners in sorted(duplicate_sequences.items()):
+            related = tuple(node_id for node_id, _ in owners)
+            for node_id, path in owners:
+                self.error(
+                    "CHILD_POLICY_EVENT_SEQUENCE_DUPLICATE",
+                    path,
+                    f"Global Luna-Max-only event_seq {event_seq} is duplicated.",
+                    node_id,
+                    related,
+                )
+
+        if events and not duplicate_sequences:
+            observed = sorted(sequence_owners)
+            expected = list(range(1, len(events) + 1))
+            if observed != expected:
+                self.error(
+                    "CHILD_POLICY_EVENT_SEQUENCE_GAP",
+                    "/nodes",
+                    (
+                        "Luna-Max-only event_seq values must form one append-only contiguous "
+                        f"sequence starting at 1; observed {observed}."
+                    ),
+                    related=(node_id for _, node_id, _ in events),
+                )
+
+    def _validate_luna_max_fail_stop(self) -> None:
+        """Forbid any post-failure spawn except the failed initial's valid transient retry."""
+        barriers: list[tuple[int, dict[str, Any]]] = []
+        for node in self.nodes_by_id.values():
+            dispatch = node["dispatch"]
+            if node["lifecycle_state"] == "dispatch_blocked" and dispatch is not None:
+                attempt_sequences = [
+                    attempt.get("event_seq")
+                    for attempt in dispatch["attempts"]
+                    if _is_int(attempt.get("event_seq"))
+                ]
+                if attempt_sequences:
+                    barriers.append((max(attempt_sequences), node))
+                continue
+
+            result = node["result"]
+            if (
+                node["lifecycle_state"] == "completed"
+                and result is not None
+                and result["status"] != "success"
+                and _is_int(result.get("event_seq"))
+            ):
+                barriers.append((result["event_seq"], node))
+
+        earliest_barrier = min(barriers, key=lambda item: item[0]) if barriers else None
+        for node_id, node in self.nodes_by_id.items():
+            dispatch = node["dispatch"]
+            if dispatch is None or earliest_barrier is None:
+                continue
+
+            for attempt_index, attempt in enumerate(dispatch["attempts"]):
+                event_seq = attempt.get("event_seq")
+                if not _is_int(event_seq):
+                    continue
+                fence_sequence, fence_node = earliest_barrier
+                if event_seq <= fence_sequence:
+                    continue
+
+                retry_of = node.get("retry_of")
+                is_direct_transient_retry = (
+                    node.get("retry_kind") == "transient"
+                    and fence_node["id"] == retry_of
+                    and fence_node["work_unit_id"] == node.get("work_unit_id")
+                    and fence_node["lifecycle_state"] == "completed"
+                    and fence_node["result"] is not None
+                    and fence_node["result"]["status"] == "failed"
+                    and fence_node["result"].get("failure_classification") == "transient"
+                )
+                if is_direct_transient_retry:
+                    # The retry-graph validator separately proves that this is the one
+                    # unchanged, budgeted retry of the failed initial node.
+                    continue
+
+                self.error(
+                    "CHILD_POLICY_FAIL_STOP_DISPATCH_FORBIDDEN",
+                    self._node_path(
+                        node_id,
+                        f"dispatch/attempts/{attempt_index}/event_seq",
+                    ),
+                    (
+                        "Luna-Max-only fail-stop forbids every spawn attempt recorded after a "
+                        "child completed without success or a node became dispatch_blocked. "
+                        "Only the failed initial node's valid direct transient retry may dispatch; "
+                        "keep all other follow-up work in the parent."
+                    ),
+                    node_id,
+                    (fence_node["id"],),
+                )
+
+    def _validate_luna_max_dependency_readiness(self) -> None:
+        """Require every Luna-Max-only spawn to follow acceptance of its dependencies."""
+        for node_id, node in self.nodes_by_id.items():
+            dispatch = node["dispatch"]
+            if dispatch is None:
+                continue
+            attempt_sequences = [
+                attempt.get("event_seq")
+                for attempt in dispatch["attempts"]
+                if _is_int(attempt.get("event_seq"))
+            ]
+            if not attempt_sequences:
+                continue
+
+            for dependency_id in node["depends_on"]:
+                dependency = self.nodes_by_id.get(dependency_id)
+                if dependency is None:
+                    continue
+                dependency_result = dependency["result"]
+                is_retry_trigger = (
+                    node.get("retry_kind") == "transient"
+                    and node.get("retry_of") == dependency_id
+                )
+                if is_retry_trigger:
+                    dependency_ready = (
+                        dependency["lifecycle_state"] == "completed"
+                        and dependency_result is not None
+                        and dependency_result["status"] == "failed"
+                        and dependency_result.get("failure_classification") == "transient"
+                    )
+                else:
+                    dependency_ready = (
+                        dependency["lifecycle_state"] == "completed"
+                        and dependency_result is not None
+                        and dependency_result["status"] == "success"
+                    )
+
+                if not dependency_ready:
+                    self.error(
+                        "CHILD_POLICY_DEPENDENCY_NOT_ACCEPTED",
+                        self._node_path(node_id, "depends_on"),
+                        (
+                            f"Dependency '{dependency_id}' must have an accepted completed result "
+                            "before this Luna-Max-only node may attempt dispatch."
+                        ),
+                        node_id,
+                        (dependency_id,),
+                    )
+                    continue
+
+                dependency_result_sequence = dependency_result.get("event_seq")
+                if (
+                    _is_int(dependency_result_sequence)
+                    and min(attempt_sequences) <= dependency_result_sequence
+                ):
+                    self.error(
+                        "CHILD_POLICY_DEPENDENCY_EVENT_ORDER",
+                        self._node_path(node_id, "dispatch/attempts"),
+                        (
+                            f"Every dispatch attempt must occur after dependency '{dependency_id}' "
+                            "recorded its accepted result event."
+                        ),
+                        node_id,
+                        (dependency_id,),
+                    )
 
     def _node_path(self, node_id: str, suffix: str = "") -> str:
         base = f"/nodes/{self.node_index[node_id]}"
@@ -1129,6 +2295,7 @@ class SemanticValidator:
         runtime_pairs: dict[tuple[str, str, str], dict[str, Any]],
         source: str,
         minimum_effort: str,
+        allow_runtime_unavailable: bool = False,
     ) -> bool:
         source_code = source.upper()
         key = _pair_key(pair)
@@ -1169,13 +2336,14 @@ class SemanticValidator:
 
         runtime_entry = runtime_pairs.get(key)
         if runtime_entry is None:
-            valid = False
-            self.error(
-                f"{source_code}_RUNTIME_PAIR_UNAVAILABLE",
-                path,
-                f"Pair {key} is not in the runtime catalog.",
-                node_id,
-            )
+            if not allow_runtime_unavailable:
+                valid = False
+                self.error(
+                    f"{source_code}_RUNTIME_PAIR_UNAVAILABLE",
+                    path,
+                    f"Pair {key} is not in the runtime catalog.",
+                    node_id,
+                )
         elif node["work_class"] not in runtime_entry["eligible_work_classes"]:
             valid = False
             self.error(
@@ -1316,6 +2484,10 @@ class SemanticValidator:
             fallback_pairs = requirements["fallback_pairs"]
             allowed = {_pair_key(pair) for pair in allowed_pairs}
             fallback = {_pair_key(pair) for pair in fallback_pairs}
+            allow_luna_max_unavailable = (
+                self.plan.get("child_policy", "adaptive") == "luna_max_only"
+                and node["lifecycle_state"] in {"planned", "dispatch_blocked"}
+            )
 
             derived_class, derived_child_effort, derived_integrator_effort = _derived_contract_floors(node)
             declared_class = requirements["required_integrator_class"]
@@ -1388,6 +2560,8 @@ class SemanticValidator:
                     runtime_pairs,
                     "allowed",
                     effective_child_effort,
+                    allow_luna_max_unavailable
+                    and _pair_key(pair) == LUNA_MAX_PAIR_KEY,
                 )
 
             for pair_index, pair in enumerate(fallback_pairs):
@@ -1407,6 +2581,8 @@ class SemanticValidator:
                     runtime_pairs,
                     "fallback",
                     effective_child_effort,
+                    allow_luna_max_unavailable
+                    and _pair_key(pair) == LUNA_MAX_PAIR_KEY,
                 )
 
             selected_valid = self._validate_pair_for_node(
@@ -1417,6 +2593,8 @@ class SemanticValidator:
                 runtime_pairs,
                 "selected",
                 effective_child_effort,
+                allow_luna_max_unavailable
+                and selected_key == LUNA_MAX_PAIR_KEY,
             )
             if selected_key not in allowed:
                 selected_valid = False
@@ -2195,6 +3373,365 @@ class SemanticValidator:
                     node_id,
                 )
 
+    def _economy_candidate_keys(self, node: dict[str, Any]) -> list[tuple[str, str, str]]:
+        origin = node["selection"]["origin"]
+        source_pairs = (
+            node["requirements"]["fallback_pairs"]
+            if origin == "fallback"
+            else node["requirements"]["allowed_model_effort_pairs"]
+        )
+        return [key for pair in source_pairs if (key := _pair_key(pair)) is not None]
+
+    def _validate_economy_profile(self) -> None:
+        profile = self.plan["profile"]
+        metric_source = self.plan["metric_source"]
+
+        for node_id, node in self.nodes_by_id.items():
+            path = self._node_path(node_id)
+            evaluation = node.get("economy_evaluation")
+            origin = node["selection"]["origin"]
+
+            if profile != "economy":
+                if evaluation is not None:
+                    self.error(
+                        "ECONOMY_EVALUATION_UNEXPECTED",
+                        f"{path}/economy_evaluation",
+                        "economy_evaluation is valid only when profile='economy'.",
+                        node_id,
+                    )
+                continue
+
+            if origin in {"explicit_user", "inherited"}:
+                if evaluation is not None:
+                    self.error(
+                        "ECONOMY_EVALUATION_NOT_APPLICABLE",
+                        f"{path}/economy_evaluation",
+                        (
+                            f"Selection origin '{origin}' constrains the pair outside economy ranking; "
+                            "omit economy_evaluation so the report cannot imply that cost selected it."
+                        ),
+                        node_id,
+                    )
+                self.warn(
+                    "ECONOMY_PROFILE_BYPASSED_BY_SELECTION_ORIGIN",
+                    f"{path}/selection/origin",
+                    f"Selection origin '{origin}' bypasses economy pair ranking for this node.",
+                    node_id,
+                )
+                continue
+
+            if evaluation is None:
+                self.error(
+                    "ECONOMY_EVALUATION_REQUIRED",
+                    f"{path}/economy_evaluation",
+                    (
+                        "Automatic and fallback selections under profile='economy' require an auditable "
+                        "qualitative or quantitative economy_evaluation."
+                    ),
+                    node_id,
+                )
+                continue
+
+            rationale = evaluation["rationale"]
+            if (
+                rationale != rationale.strip()
+                or _contains_invisible_or_control(rationale)
+                or not _has_visible_base(rationale)
+            ):
+                self.error(
+                    "ECONOMY_RATIONALE_INVALID",
+                    f"{path}/economy_evaluation/rationale",
+                    "Economy rationale must contain visible text without surrounding whitespace or control characters.",
+                    node_id,
+                )
+
+            if evaluation["delegation_decision"] != "delegate":
+                self.error(
+                    "ECONOMY_DELEGATION_DECISION_INVALID",
+                    f"{path}/economy_evaluation/delegation_decision",
+                    (
+                        "A node in the child ledger must have delegation_decision='delegate'. "
+                        "Keep parent-preferred work out of nodes."
+                    ),
+                    node_id,
+                )
+
+            expected_keys = self._economy_candidate_keys(node)
+            expected_set = set(expected_keys)
+            selected_key = _pair_key(node["selection"]["selected_pair"])
+            mode = evaluation["mode"]
+
+            if mode == "qualitative":
+                for field_name in (
+                    "formula_version",
+                    "cost_unit",
+                    "cohort_id",
+                    "parent_estimate",
+                ):
+                    if evaluation[field_name] is not None:
+                        self.error(
+                            "ECONOMY_QUALITATIVE_FIELD_INVALID",
+                            f"{path}/economy_evaluation/{field_name}",
+                            f"Qualitative economy evaluation requires {field_name}=null.",
+                            node_id,
+                        )
+                if metric_source in {"runtime", "local_telemetry"}:
+                    self.error(
+                        "ECONOMY_QUALITATIVE_SOURCE_INVALID",
+                        "/metric_source",
+                        (
+                            f"metric_source '{metric_source}' represents comparable measurements and "
+                            "requires mode='quantitative'. Use none/community_prior when no comparable "
+                            "numeric cost evidence exists."
+                        ),
+                        node_id,
+                    )
+                if evaluation["candidate_estimates"]:
+                    self.error(
+                        "ECONOMY_QUALITATIVE_ESTIMATES_FORBIDDEN",
+                        f"{path}/economy_evaluation/candidate_estimates",
+                        "Qualitative evaluation cannot include numeric candidate estimates.",
+                        node_id,
+                    )
+                if evaluation["tie_break"] != "declared_order":
+                    self.error(
+                        "ECONOMY_QUALITATIVE_TIE_BREAK_INVALID",
+                        f"{path}/economy_evaluation/tie_break",
+                        "Qualitative evaluation requires tie_break='declared_order'.",
+                        node_id,
+                    )
+                order_keys = [
+                    key
+                    for candidate in evaluation["qualitative_order"]
+                    if (key := _pair_key(candidate)) is not None
+                ]
+                if len(order_keys) != len(expected_keys) or set(order_keys) != expected_set:
+                    self.error(
+                        "ECONOMY_QUALITATIVE_CANDIDATE_SET_MISMATCH",
+                        f"{path}/economy_evaluation/qualitative_order",
+                        (
+                            "Qualitative order must contain every economy-ranked candidate exactly once. "
+                            f"Expected {sorted(expected_set)}, got {sorted(set(order_keys))}."
+                        ),
+                        node_id,
+                    )
+                if not order_keys or order_keys[0] != selected_key:
+                    self.error(
+                        "ECONOMY_QUALITATIVE_SELECTED_NOT_FIRST",
+                        f"{path}/economy_evaluation/qualitative_order",
+                        "The selected pair must be first in the declared qualitative economy order.",
+                        node_id,
+                    )
+                self.warn(
+                    "ECONOMY_QUALITATIVE_EVALUATION",
+                    f"{path}/economy_evaluation/mode",
+                    "Economy ordering is qualitative; do not claim a measured cost optimum.",
+                    node_id,
+                )
+                continue
+
+            if metric_source not in {"runtime", "local_telemetry"}:
+                self.error(
+                    "ECONOMY_QUANTITATIVE_SOURCE_INSUFFICIENT",
+                    "/metric_source",
+                    (
+                        "Quantitative economy evaluation requires comparable runtime or local_telemetry data; "
+                        f"metric_source is '{metric_source}'."
+                    ),
+                    node_id,
+                )
+            if evaluation["formula_version"] != ECONOMY_FORMULA_VERSION:
+                self.error(
+                    "ECONOMY_FORMULA_VERSION_INVALID",
+                    f"{path}/economy_evaluation/formula_version",
+                    f"Quantitative economy evaluation requires '{ECONOMY_FORMULA_VERSION}'.",
+                    node_id,
+                )
+            for field_name in ("cost_unit", "cohort_id"):
+                value = evaluation[field_name]
+                if (
+                    not isinstance(value, str)
+                    or value != value.strip()
+                    or _contains_invisible_or_control(value)
+                    or not _has_visible_base(value)
+                ):
+                    self.error(
+                        "ECONOMY_QUANTITATIVE_FIELD_REQUIRED",
+                        f"{path}/economy_evaluation/{field_name}",
+                        f"Quantitative economy evaluation requires a visible {field_name} string.",
+                        node_id,
+                    )
+            parent_estimate = evaluation["parent_estimate"]
+            if not isinstance(parent_estimate, dict):
+                self.error(
+                    "ECONOMY_QUANTITATIVE_FIELD_REQUIRED",
+                    f"{path}/economy_evaluation/parent_estimate",
+                    "Quantitative economy evaluation requires a complete parent_estimate cost vector.",
+                    node_id,
+                )
+            if evaluation["tie_break"] != "pair_key_lexicographic":
+                self.error(
+                    "ECONOMY_QUANTITATIVE_TIE_BREAK_INVALID",
+                    f"{path}/economy_evaluation/tie_break",
+                    "Quantitative evaluation requires tie_break='pair_key_lexicographic'.",
+                    node_id,
+                )
+            if evaluation["qualitative_order"]:
+                self.error(
+                    "ECONOMY_QUANTITATIVE_ORDER_FORBIDDEN",
+                    f"{path}/economy_evaluation/qualitative_order",
+                    "Quantitative evaluation must derive ranking from candidate estimates, not a declared order.",
+                    node_id,
+                )
+
+            estimates = evaluation["candidate_estimates"]
+            estimate_keys = [
+                key for estimate in estimates if (key := _pair_key(estimate["pair"])) is not None
+            ]
+            if len(estimate_keys) != len(expected_keys) or set(estimate_keys) != expected_set:
+                self.error(
+                    "ECONOMY_CANDIDATE_SET_MISMATCH",
+                    f"{path}/economy_evaluation/candidate_estimates",
+                    (
+                        "Quantitative estimates must cover every economy-ranked candidate exactly once. "
+                        f"Expected {sorted(expected_set)}, got {sorted(set(estimate_keys))}."
+                    ),
+                    node_id,
+                )
+
+            root_evidence = self.plan["evidence_id_or_window"]
+            evidence_prefix = f"{root_evidence}#" if isinstance(root_evidence, str) else None
+            seen_evidence_refs: set[str] = set()
+
+            def validate_evidence_ref(evidence_ref: str, evidence_path: str, subject: str) -> None:
+                if (
+                    evidence_ref != evidence_ref.strip()
+                    or _contains_invisible_or_control(evidence_ref)
+                    or not _has_visible_base(evidence_ref)
+                ):
+                    self.error(
+                        "ECONOMY_EVIDENCE_REF_INVALID",
+                        evidence_path,
+                        f"{subject} evidence_ref must contain visible text without surrounding whitespace or control characters.",
+                        node_id,
+                    )
+                if evidence_prefix is not None and (
+                    not evidence_ref.startswith(evidence_prefix)
+                    or len(evidence_ref) == len(evidence_prefix)
+                ):
+                    self.error(
+                        "ECONOMY_EVIDENCE_WINDOW_MISMATCH",
+                        evidence_path,
+                        (
+                            f"{subject} evidence_ref must be namespaced under the root evidence window "
+                            f"as '{evidence_prefix}<record-id>'."
+                        ),
+                        node_id,
+                    )
+                if evidence_ref in seen_evidence_refs:
+                    self.error(
+                        "ECONOMY_EVIDENCE_REF_DUPLICATE",
+                        evidence_path,
+                        f"Economy evidence_ref '{evidence_ref}' is reused within the node evaluation.",
+                        node_id,
+                    )
+                seen_evidence_refs.add(evidence_ref)
+
+            parent_total: Decimal | None = None
+            if isinstance(parent_estimate, dict):
+                parent_path = f"{path}/economy_evaluation/parent_estimate"
+                actual_parent = self.plan["orchestration"]["parent"]
+                actual_parent_key = (
+                    actual_parent["model"],
+                    actual_parent["family"],
+                    actual_parent["effort"],
+                )
+                parent_key = _pair_key(parent_estimate["pair"])
+                if parent_key != actual_parent_key:
+                    self.error(
+                        "ECONOMY_PARENT_PAIR_MISMATCH",
+                        f"{parent_path}/pair",
+                        (
+                            f"Parent estimate pair {parent_key} does not match the actual orchestration "
+                            f"parent pair {actual_parent_key}."
+                        ),
+                        node_id,
+                    )
+                validate_evidence_ref(
+                    parent_estimate["evidence_ref"],
+                    f"{parent_path}/evidence_ref",
+                    "Parent",
+                )
+                parent_total = _economy_expected_total(parent_estimate)
+                parent_declared_total = Decimal(str(parent_estimate["expected_total_cost"])).quantize(
+                    ECONOMY_QUANTUM,
+                    rounding=ROUND_HALF_EVEN,
+                )
+                if parent_total != parent_declared_total:
+                    self.error(
+                        "ECONOMY_PARENT_TOTAL_MISMATCH",
+                        f"{parent_path}/expected_total_cost",
+                        (
+                            f"Declared parent expected_total_cost {parent_declared_total} does not match "
+                            f"the '{ECONOMY_FORMULA_VERSION}' result {parent_total}."
+                        ),
+                        node_id,
+                    )
+
+            totals: dict[tuple[str, str, str], Decimal] = {}
+            for estimate_index, estimate in enumerate(estimates):
+                estimate_path = f"{path}/economy_evaluation/candidate_estimates/{estimate_index}"
+                key = _pair_key(estimate["pair"])
+                evidence_ref = estimate["evidence_ref"]
+                validate_evidence_ref(
+                    evidence_ref,
+                    f"{estimate_path}/evidence_ref",
+                    "Candidate",
+                )
+                computed_total = _economy_expected_total(estimate)
+                declared_total = Decimal(str(estimate["expected_total_cost"])).quantize(
+                    ECONOMY_QUANTUM,
+                    rounding=ROUND_HALF_EVEN,
+                )
+                if computed_total != declared_total:
+                    self.error(
+                        "ECONOMY_TOTAL_MISMATCH",
+                        f"{estimate_path}/expected_total_cost",
+                        (
+                            f"Declared expected_total_cost {declared_total} does not match the "
+                            f"'{ECONOMY_FORMULA_VERSION}' result {computed_total}."
+                        ),
+                        node_id,
+                    )
+                if key is not None:
+                    totals[key] = computed_total
+
+            if selected_key in totals and totals:
+                minimum_total = min(totals.values())
+                tied_minima = sorted(key for key, total in totals.items() if total == minimum_total)
+                deterministic_winner = tied_minima[0]
+                if selected_key != deterministic_winner:
+                    self.error(
+                        "ECONOMY_SELECTED_NOT_MINIMUM",
+                        f"{path}/selection/selected_pair",
+                        (
+                            f"Selected pair {selected_key} is not the deterministic minimum-cost candidate; "
+                            f"expected {deterministic_winner} at {minimum_total}."
+                        ),
+                        node_id,
+                    )
+                selected_cost = totals[selected_key]
+                if parent_total is not None and selected_cost >= parent_total:
+                    self.error(
+                        "ECONOMY_DELEGATION_NOT_BENEFICIAL",
+                        f"{path}/economy_evaluation/parent_estimate/expected_total_cost",
+                        (
+                            f"Selected child expected cost {selected_cost} is not lower than parent "
+                            f"expected cost {parent_total}; keep this work in the parent."
+                        ),
+                        node_id,
+                    )
+
     def _validate_metric_claim(self) -> None:
         profile = self.plan["profile"]
         source = self.plan["metric_source"]
@@ -2264,7 +3801,9 @@ class SemanticValidator:
         self._validate_orchestration()
         self._validate_dependencies()
         self._validate_concurrency_and_conflicts()
+        self._validate_child_policy()
         self._validate_selection()
+        self._validate_economy_profile()
         self._validate_observability()
         self._validate_evidence_and_review()
         self._validate_metric_claim()
@@ -2334,10 +3873,25 @@ def render_routing_report(plan: dict[str, Any]) -> str:
         )
         shown_attempt = effective_attempt or (attempts[-1] if attempts else None)
         receipt_chain = "; ".join(
-            f"a{attempt['attempt_index']} {attempt['receipt_status']} {attempt['receipt_ref']}"
+            (
+                (f"e{attempt['event_seq']} " if "event_seq" in attempt else "")
+                + f"a{attempt['attempt_index']} {attempt['receipt_status']} {attempt['receipt_ref']}"
+            )
             for attempt in attempts
         )
         requested_pair = node["selection"]["requested_pair"] or node["selection"]["selected_pair"]
+        if node["result"] is not None:
+            result_status = node["result"]["status"]
+            failure_classification = node["result"].get("failure_classification")
+            if failure_classification not in {None, "none"}:
+                result_status = f"{result_status}/{failure_classification}"
+            result_text = (
+                f"{result_status} (e{node['result']['event_seq']})"
+                if "event_seq" in node["result"]
+                else result_status
+            )
+        else:
+            result_text = node["lifecycle_state"]
         rows.append(
             (
                 shown_attempt["agent_label"] if shown_attempt is not None else "not dispatched",
@@ -2348,12 +3902,10 @@ def render_routing_report(plan: dict[str, Any]) -> str:
                 else "—",
                 shown_attempt["confirmation_status"] if shown_attempt is not None else "planned",
                 receipt_chain or "—",
-                node["result"]["status"]
-                if node["result"] is not None
-                else node["lifecycle_state"],
+                result_text,
                 node["objective"],
             )
-        )
+    )
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
@@ -2362,6 +3914,88 @@ def render_routing_report(plan: dict[str, Any]) -> str:
         "| " + " | ".join(_markdown_cell(value) for value in row) + " |"
         for row in rows
     )
+    lines.extend(
+        [
+            "",
+            f"Profile: `{plan['profile']}`",
+            f"Metric source: `{plan['metric_source']}`",
+            f"Child policy: `{plan.get('child_policy', 'adaptive')}`",
+        ]
+    )
+    if plan["metric_source"] != "none":
+        lines.append(
+            "Metric evidence: "
+            f"`{plan['metric_as_of']}` / `{plan['evidence_id_or_window']}`"
+        )
+    elif plan["profile"] in {"latency", "economy"}:
+        lines.append("Optimization claim: qualitative only; no quantitative metric source.")
+
+    if plan["profile"] == "economy":
+        economy_headers = (
+            "node",
+            "mode",
+            "selected pair",
+            "child expected cost",
+            "parent expected cost",
+            "unit",
+            "decision",
+            "basis",
+        )
+        economy_rows: list[tuple[Any, ...]] = []
+        for node in plan["nodes"]:
+            evaluation = node.get("economy_evaluation")
+            selected_pair = node["selection"]["selected_pair"]
+            if evaluation is None:
+                economy_rows.append(
+                    (
+                        node["id"],
+                        f"bypassed:{node['selection']['origin']}",
+                        _pair_text(selected_pair),
+                        "—",
+                        "—",
+                        "—",
+                        "constrained",
+                        "Profile did not select this pair.",
+                    )
+                )
+                continue
+            selected_key = _pair_key(selected_pair)
+            selected_estimate = next(
+                (
+                    estimate
+                    for estimate in evaluation["candidate_estimates"]
+                    if _pair_key(estimate["pair"]) == selected_key
+                ),
+                None,
+            )
+            economy_rows.append(
+                (
+                    node["id"],
+                    evaluation["mode"],
+                    _pair_text(selected_pair),
+                    selected_estimate["expected_total_cost"]
+                    if selected_estimate is not None
+                    else "qualitative",
+                    evaluation["parent_estimate"]["expected_total_cost"]
+                    if evaluation["parent_estimate"] is not None
+                    else "—",
+                    evaluation["cost_unit"] if evaluation["cost_unit"] is not None else "—",
+                    evaluation["delegation_decision"],
+                    evaluation["rationale"],
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "Economy decisions:",
+                "| " + " | ".join(economy_headers) + " |",
+                "| " + " | ".join("---" for _ in economy_headers) + " |",
+            ]
+        )
+        lines.extend(
+            "| " + " | ".join(_markdown_cell(value) for value in row) + " |"
+            for row in economy_rows
+        )
     return "\n".join(lines)
 
 

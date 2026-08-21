@@ -1,10 +1,11 @@
 {
   "schema_version": "aar.routing-ledger.v2",
   "ledger_phase": "finalized",
-  "profile": "balanced",
-  "metric_source": "none",
-  "metric_as_of": null,
-  "evidence_id_or_window": null,
+  "profile": "economy",
+  "child_policy": "adaptive",
+  "metric_source": "local_telemetry",
+  "metric_as_of": "2026-08-21T08:00:00+08:00",
+  "evidence_id_or_window": "parser-fix-comparable-window-001",
   "orchestration": {
     "state": "manual_allowed",
     "parent": {
@@ -134,6 +135,75 @@
           "effort": "high"
         },
         "fallback_reason": null
+      },
+      "economy_evaluation": {
+        "mode": "quantitative",
+        "formula_version": "expected-total-cost-v1",
+        "cost_unit": "normalized-cost-unit",
+        "cohort_id": "bounded-parser-fix-same-tool-surface",
+        "parent_estimate": {
+          "pair": {
+            "model": "gpt-5.6-sol",
+            "family": "sol",
+            "effort": "xhigh"
+          },
+          "sample_size": 12,
+          "evidence_ref": "parser-fix-comparable-window-001#parent:gpt-5.6-sol:xhigh",
+          "initial_cost": 2.0,
+          "retry_probability": 0.05,
+          "retry_cost_if_triggered": 2.0,
+          "rework_probability": 0.02,
+          "rework_cost_if_triggered": 2.5,
+          "review_cost": 0.1,
+          "escalation_probability": 0.01,
+          "escalation_cost_if_triggered": 3.0,
+          "coordination_cost": 0.1,
+          "expected_total_cost": 2.38
+        },
+        "candidate_estimates": [
+          {
+            "pair": {
+              "model": "gpt-5.6-terra",
+              "family": "terra",
+              "effort": "high"
+            },
+            "sample_size": 12,
+            "evidence_ref": "parser-fix-comparable-window-001#candidate:gpt-5.6-terra:high",
+            "initial_cost": 1.0,
+            "retry_probability": 0.1,
+            "retry_cost_if_triggered": 1.0,
+            "rework_probability": 0.05,
+            "rework_cost_if_triggered": 1.5,
+            "review_cost": 0.1,
+            "escalation_probability": 0.02,
+            "escalation_cost_if_triggered": 2.0,
+            "coordination_cost": 0.1,
+            "expected_total_cost": 1.415
+          },
+          {
+            "pair": {
+              "model": "gpt-5.6-sol",
+              "family": "sol",
+              "effort": "high"
+            },
+            "sample_size": 12,
+            "evidence_ref": "parser-fix-comparable-window-001#candidate:gpt-5.6-sol:high",
+            "initial_cost": 2.0,
+            "retry_probability": 0.05,
+            "retry_cost_if_triggered": 2.0,
+            "rework_probability": 0.02,
+            "rework_cost_if_triggered": 2.5,
+            "review_cost": 0.1,
+            "escalation_probability": 0.01,
+            "escalation_cost_if_triggered": 3.0,
+            "coordination_cost": 0.1,
+            "expected_total_cost": 2.38
+          }
+        ],
+        "qualitative_order": [],
+        "tie_break": "pair_key_lexicographic",
+        "delegation_decision": "delegate",
+        "rationale": "Comparable local parser-fix observations put Terra High below Sol High and the parent baseline."
       },
       "lifecycle_state": "completed",
       "dispatch": {

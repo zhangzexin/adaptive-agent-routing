@@ -1,6 +1,6 @@
 interface:
   display_name: "自适应多代理路由 V2"
-  short_description: "按契约路由，并公开核验每个子代理的模型、强度与回执"
-  default_prompt: "使用 $adaptive-agent-routing 处理以下任务，按 V2 契约判断是否委派，并逐个公开子代理的模型、推理强度、派发回执与结果：<任务>"
+  short_description: "按 V2 契约路由；支持可审计 Economy 与 Luna-Max-only 策略"
+  default_prompt: "使用 $adaptive-agent-routing 处理以下任务。省略 profile= 时记录 profile=balanced；省略 children= 时记录 child_policy=adaptive，并继续按所选 profile 排序合格候选。Economy 的自动/回退子节点必须记录可校验的定性顺序或量化成本评估；显式固定/受保证继承节点不伪造评估，报告 Economy bypass。若带 children=luna-max，则 child_policy=luna_max_only，所有实际子代理精确为 gpt-5.6-luna / max。逐个公开 profile、模型、推理强度、派发回执与结果：<任务>"
 policy:
   allow_implicit_invocation: false
