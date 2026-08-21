@@ -1,0 +1,179 @@
+{
+  "schema_version": "aar.routing-ledger.v2",
+  "ledger_phase": "finalized",
+  "profile": "balanced",
+  "metric_source": "none",
+  "metric_as_of": null,
+  "evidence_id_or_window": null,
+  "orchestration": {
+    "state": "manual_allowed",
+    "parent": {
+      "model": "gpt-5.6-sol",
+      "family": "sol",
+      "effort": "xhigh",
+      "integrator_class": "critical"
+    }
+  },
+  "runtime": {
+    "max_concurrent_children": 1,
+    "available_pairs": [
+      {
+        "model": "gpt-5.6-sol",
+        "family": "sol",
+        "effort": "xhigh",
+        "eligible_work_classes": ["structured", "general", "open", "critical"]
+      },
+      {
+        "model": "gpt-5.6-sol",
+        "family": "sol",
+        "effort": "high",
+        "eligible_work_classes": ["structured", "general", "open", "critical"]
+      },
+      {
+        "model": "gpt-5.6-terra",
+        "family": "terra",
+        "effort": "high",
+        "eligible_work_classes": ["structured", "general"]
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "parser_fix",
+      "executor_id": "executor_parser_fix",
+      "wave": 0,
+      "role": "implementer",
+      "objective": "Implement and validate the bounded parser correction.",
+      "why_delegate": "The change is a coherent implementation bundle with targeted tests.",
+      "work_class": "general",
+      "risk": "medium",
+      "context_scope": "repository",
+      "oracle": "strong",
+      "access_mode": "workspace_write",
+      "depends_on": [],
+      "known_facts": [
+        "The failing parser cases and owned implementation file are known."
+      ],
+      "hypotheses": [
+        "The defect is confined to the parser implementation."
+      ],
+      "owned_mutable_surfaces": [
+        "src/parser.ts"
+      ],
+      "read_only_surfaces": [
+        "tests/parser.test.ts"
+      ],
+      "write_conflict_groups": [
+        "module:parser"
+      ],
+      "forbidden_actions": [
+        "Do not change public parser interfaces or unrelated files."
+      ],
+      "deliverables": [
+        "A bounded parser fix with targeted validation evidence."
+      ],
+      "acceptance_criteria": [
+        "Targeted parser cases pass and the public interface is unchanged."
+      ],
+      "validation_steps": [
+        {
+          "id": "parser_tests",
+          "kind": "test",
+          "phase": "post",
+          "required": true,
+          "target": "tests/parser.test.ts"
+        }
+      ],
+      "expected_evidence": [
+        "A passing targeted test result and an inspected diff limited to the owned file."
+      ],
+      "attempt_budget": {
+        "transient_retries": 1,
+        "substantive_attempts": 2,
+        "max_uses": 1
+      },
+      "recovery_steps": [
+        "On failure, preserve the diff and return control to the parent without expanding scope."
+      ],
+      "stop_conditions": [
+        "Stop after acceptance passes or the attempt budget is exhausted."
+      ],
+      "escalate_when": [
+        "Escalate if the defect depends on repository-wide or public-interface changes."
+      ],
+      "requirements": {
+        "required_integrator_class": "general",
+        "minimum_child_effort": "high",
+        "minimum_integrator_effort": "high",
+        "allowed_model_effort_pairs": [
+          {
+            "model": "gpt-5.6-terra",
+            "family": "terra",
+            "effort": "high"
+          },
+          {
+            "model": "gpt-5.6-sol",
+            "family": "sol",
+            "effort": "high"
+          }
+        ],
+        "fallback_pairs": [
+          {
+            "model": "gpt-5.6-sol",
+            "family": "sol",
+            "effort": "high"
+          }
+        ]
+      },
+      "selection": {
+        "origin": "automatic",
+        "requested_pair": null,
+        "selected_pair": {
+          "model": "gpt-5.6-terra",
+          "family": "terra",
+          "effort": "high"
+        },
+        "fallback_reason": null
+      },
+      "lifecycle_state": "completed",
+      "dispatch": {
+        "attempts": [
+          {
+            "attempt_index": 1,
+            "mode": "explicit",
+            "task_name": "gpt_5_6_terra_high_parser_fix_a1",
+            "agent_label": "implementer (gpt-5.6-terra, high)",
+            "fork_turns": "none",
+            "requested_pair": {
+              "model": "gpt-5.6-terra",
+              "family": "terra",
+              "effort": "high"
+            },
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "high",
+            "receipt_status": "accepted",
+            "receipt_ref": "spawn_agent:example-agent-001",
+            "effective_pair": {
+              "model": "gpt-5.6-terra",
+              "family": "terra",
+              "effort": "high"
+            },
+            "confirmation_status": "confirmed-explicit"
+          }
+        ],
+        "effective_attempt": 1
+      },
+      "result": {
+        "status": "success",
+        "dispatch_attempt": 1,
+        "agent_label": "implementer (gpt-5.6-terra, high)",
+        "assigned_pair_echo": {
+          "model": "gpt-5.6-terra",
+          "family": "terra",
+          "effort": "high"
+        },
+        "confirmation_status_echo": "confirmed-explicit"
+      }
+    }
+  ]
+}
